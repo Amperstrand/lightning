@@ -1183,9 +1183,9 @@ static struct command_result *json_pay(struct command *cmd,
 		return command_fail(cmd, PAY_INVOICE_EXPIRED, "Invoice expired");
 
 	if (invmsat) {
-		if (msat) {
+		if (msat && *msat != *invmsat) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "msatoshi parameter unnecessary");
+					    "msatoshi parameter must be None or equal to value decoded from invoice");
 		}
 		p->amount = *invmsat;
 		tal_free(invmsat);
