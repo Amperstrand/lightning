@@ -1443,6 +1443,11 @@ static u8 *handle_sign_mutual_close_tx(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
 }
 
+/* BOLT #2:
+ * MUST set `shared_input_signature` to a valid ECDSA signature for the
+ * `tx_add_input` spending the previous channel funding output using the
+ * `funding_pubkey` that matches this input.
+ */
 /* This is used by channeld to sign the final splice tx. */
 static u8 *handle_sign_splice_tx(struct hsmd_client *c, const u8 *msg_in)
 {

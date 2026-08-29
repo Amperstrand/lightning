@@ -415,6 +415,16 @@ static void check_mutual_channel_ready(const struct peer *peer)
 		lock_signer_outpoint(&peer->channel->funding);
 }
 
+/* BOLT #2:
+ * If any splice transaction reaches acceptable depth:
+ * MUST send `splice_locked` with the `txid` of that transaction.
+ */
+/* BOLT #2:
+ * Once a node has sent and received `splice_locked`:
+ * If the `splice_txid`s match:
+ * MUST stop sending `commitment_signed` for RBF attempts and ancestors
+ * of this splice transaction.
+ */
 /* Call this method when splice_locked status are changed. If both sides have
  * splice_locked'ed than this function consumes the `splice_locked_ready` values
  * and considers the channel funding to be switched to the splice tx. */
@@ -773,7 +783,7 @@ static void handle_peer_blockheight_change(struct peer *peer, const u8 *msg)
 				 "Bad update_blockheight %s",
 				 tal_hex(msg, msg));
 
-	/* BOLT- #2:
+	/* BOLT #2:
 	 * A receiving node:
 	 *   ...
 	 *   - if the sender is not the initiator:
@@ -790,7 +800,7 @@ static void handle_peer_blockheight_change(struct peer *peer, const u8 *msg)
 		     " our current height %u",
 		     blockheight, current, peer->our_blockheight);
 
-	/* BOLT- #2:
+	/* BOLT #2:
 	 * A receiving node:
 	 *   - if the `update_blockheight` is less than the last
 	 *     received `blockheight`:
@@ -814,7 +824,7 @@ static void handle_peer_blockheight_change(struct peer *peer, const u8 *msg)
 				 "update_blockheight %u older than previous %u",
 				 blockheight, current);
 
-	/* BOLT- #2:
+	/* BOLT #2:
 	 * A receiving node:
 	 *    ...
 	 *   - if `blockheight` is more than 1008 blocks behind
@@ -1279,6 +1289,10 @@ static u8 *send_commit_part(const tal_t *ctx,
 			     tal_count(htlc_sigs));
 	}
 
+	/* BOLT #2:
+	 * MUST set `funding_txid` in each `commitment_signed` message to match the
+	 * funding transaction spent by that commitment transaction.
+	 */
 	msg = towire_commitment_signed(ctx, &peer->channel_id,
 				       &commit_sig.s,
 				       raw_sigs(tmpctx, htlc_sigs),
@@ -1492,6 +1506,9 @@ static void send_commit(struct peer *peer)
 	if (local_anchor)
 		tal_arr_expand(&anchors_info, *local_anchor);
 
+	/* BOLT #2:
+	 * Uses the same `commitment_number` as the existing commitment transaction.
+	 */
 	/* Loop over current inflights
 	 * BOLT-0d8b701614b09c6ee4172b04da2203e73deec7e2 #2:
 	 *
@@ -2043,13 +2060,13 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad commit_sig %s", tal_hex(msg, msg));
 
-	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 	 *  - If the sending node sent `start_batch` and we are processing a batch of
 	 *    `commitment_signed` messages:
 	 */
 	if (msg_batch && tal_count(msg_batch) > 1) {
 
-		/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+		/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 		 *    - If `funding_txid` is missing in one of the `commitment_signed` messages:
 		 *      - MUST send an `error` and fail the channel.
 		 */
@@ -2058,7 +2075,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 					"Must send funding_txid when sending"
 					" a commitment batch.");
 
-		/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+		/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 		 *    - Otherwise (no pending splice transactions):
 		 *...
 		 *      - If `commitment_signed` is missing for the current funding transaction:
@@ -2073,9 +2090,19 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 					fmt_bitcoin_txid(tmpctx, &peer->channel->funding.txid));
 	}
 
-	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 	 *    - If `funding_txid` is missing in one of the `commitment_signed` messages:
 	 *      - MUST send an `error` and fail the channel.
+	 */
+	/* BOLT #2:
+	 * If `funding_txid` is missing in one of the `commitment_signed` messages:
+	 * MUST send an `error` and fail the channel.
+	 */
+	/* BOLT #2:
+	 * MUST validate each `commitment_signed` based on `funding_txid`.
+	 */
+	/* BOLT #2:
+	 * MUST NOT respond with `revoke_and_ack`.
 	 */
 	if (commit_index && !cs_tlv->splice_info)
 		peer_failed_err(peer->pps, &peer->channel_id,
@@ -2288,7 +2315,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				tal_count(peer->splice_state->inflights));
 
 	commitsigs = tal_arr(NULL, const struct commitsig*, 0);
-	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 	 *    - If there are pending splice transactions:
 	 *      - MUST validate each `commitment_signed` based on `funding_txid`.
 	 *      - If `commitment_signed` is missing for a funding transaction:
@@ -2415,7 +2442,7 @@ static struct commitsig_info *handle_peer_commit_sig_batch(struct peer *peer,
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad commit_sig %s", tal_hex(msg, msg));
 
-	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 	 *  - If there are pending splice transactions and the sending node did not
 	 *    send `start_batch` followed by a batch of `commitment_signed` messages:
 	 *    - MUST send an `error` and fail the channel.
@@ -2461,7 +2488,7 @@ static struct commitsig_info *handle_peer_commit_sig_batch(struct peer *peer,
 		msg_batch[i] = sub_msg;
 	}
 
-	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717 #2:
 	 *    - Otherwise (no pending splice transactions):
 	 *      - MUST ignore `commitment_signed` where `funding_txid` does not match
 	 *        the current funding transaction.
@@ -5693,6 +5720,13 @@ static void peer_reconnect(struct peer *peer,
 				 * tal off peer */
 				send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
 			}
+			/* BOLT #2:
+			 * MUST set `next_funding_txid` to the txid of that interactive transaction.
+			 */
+			/* BOLT #2:
+			 * if it has not received `commitment_signed` for this `next_funding_txid`:
+			 * MUST set the `commitment_signed` bit in `retransmit_flags`.
+			 */
 			send_tlvs->next_funding = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
 			send_tlvs->next_funding->next_funding_txid = inflight->outpoint.txid;
 
@@ -5979,7 +6013,7 @@ static void peer_reconnect(struct peer *peer,
 		peer_write(peer->pps, take(msg));
 	}
 
-	/* BOLT-??? #2
+	/* BOLT-??? #2:
 	 * A receiving node:
 	 *   - if splice transactions are pending and `my_current_funding_locked` matches one of
 	 *     those splice transactions, for which it hasn't received `splice_locked` yet:
@@ -5990,7 +6024,7 @@ static void peer_reconnect(struct peer *peer,
 			if (!bitcoin_txid_eq(&itr->outpoint.txid,
 					     &recv_tlvs->my_current_funding_locked->my_current_funding_locked_txid))
 				continue;
-			/* BOLT-??? #2
+			/* BOLT-??? #2:
 			 *     - MUST process `my_current_funding_locked` as if it was receiving `splice_locked`
 			 *       for this `txid`.
 			 */
@@ -6132,7 +6166,7 @@ static void peer_reconnect(struct peer *peer,
 	if (retransmit_revoke_and_ack && peer->last_was_revoke)
 		resend_revoke(peer);
 
-	/* BOLT-splice #2
+	/* BOLT-splice #2:
 	 *     1. type: 5 (`my_current_funding_locked`)
 	 *     2. data:
 	 *         * [`sha256`:`my_current_funding_locked_txid`]
@@ -6513,7 +6547,7 @@ static void handle_blockheight(struct peer *peer, const u8 *inmsg)
 		u32 peer_height = get_blockheight(peer->channel->blockheight_states,
 						  peer->channel->opener,
 						  REMOTE);
-		/* BOLT- #2:
+		/* BOLT #2:
 		 * The node _not responsible_ for initiating the channel:
 		 *   ...
 		 *   - if last received `blockheight` is > 1008 behind

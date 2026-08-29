@@ -1,0 +1,8 @@
+# greatspectations config (Amperstrand fork, branch spectate/splice-anchors)
+# Spec source: lightning/bolts checkout, PINNED. Bump deliberately: a failing
+# old quote after a bump = the spec moved under us (that's the alarm working).
+#   pinned: 152897261850d93c4f4597f39cf22d7d22d6ede6 (2026-08-29)
+[sources.BOLT]
+format = "markdown"
+dir = "../bolts"
+pattern = "**/{id:02d}-*.md"
