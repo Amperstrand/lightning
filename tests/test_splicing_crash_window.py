@@ -1,3 +1,4 @@
+import time
 from fixtures import *  # noqa: F401,F403
 import pytest
 import unittest
@@ -94,7 +95,6 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
     # cross-session contamination vector (a parallel invocation overwrote
     # run 4's dumps mid-analysis — STATE.md "CROSS-RUN CONTAMINATION").
     import os
-    import time
     dumpdir = f"/tmp/crash-window-logs-{int(time.time())}"
     os.makedirs(dumpdir, exist_ok=True)
     with open(dumpdir + '/l1.log', 'w') as f:
