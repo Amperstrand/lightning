@@ -76,7 +76,7 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
     outcome = 'NO-CONVERGENCE-60s (the quiet stall)'
     while time.time() < deadline:
         if l2.daemon.is_in_log(r'Bad commit_sig') or l1.daemon.is_in_log(r'Bad commit_sig'):
-            outcome = 'LOOP (Bad commit_sig on stock -- THE REPRO)'
+            outcome = 'LOOP (Bad commit_sig — the rejection loop)'
             break
         if (l1.daemon.is_in_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL')
                 and l2.daemon.is_in_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL')):
