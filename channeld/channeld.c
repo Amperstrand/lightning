@@ -1689,6 +1689,12 @@ static void peer_set_local_per_commit(struct peer *peer,
 	peer->prev_local_per_commit = peer->next_local_per_commit;
 	peer->have_prev_local_per_commit = true;
 	peer->next_local_per_commit = *new_pc;
+	/* fork-local diagnostics: every cache write, with the index the
+	 * validation build will pair it with (the point-desync decode —
+	 * see docs/HACK-SPLICE-RESUME-FEE-RETRY.md). */
+	status_unusual("fork-cache-write: next_index[LOCAL]=%"PRIu64
+		       " point=%s", peer->next_index[LOCAL],
+		       fmt_pubkey(tmpctx, new_pc));
 }
 
 static void send_revocation(struct peer *peer,
