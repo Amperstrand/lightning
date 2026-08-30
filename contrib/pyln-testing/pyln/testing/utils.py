@@ -805,7 +805,16 @@ class LightningD(TailableProc):
         return self.cmd_prefix + [self.executable] + self.early_opts + opts
 
     def start(self, stdin=None, wait_for_initialized=True, stderr_redir=False):
-        self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
+        # NO_BTCPROXY=1: point the nodes at the REAL bitcoind port instead of
+        # the cheroot instrumentation proxy — long VLS+valgrind runs saw the
+        # proxy's chain serving go silent mid-run (crash16: both nodes' last
+        # block at 08:42:29, ten minutes of silence while the test mined six
+        # blocks direct). The proxy exists for canned-response instrumentation
+        # our splice runs never use; bypassing it removes the variable.
+        if os.environ.get('NO_BTCPROXY', '') == '1':
+            self.opts['bitcoin-rpcport'] = self.rpcproxy.bitcoind.rpcport
+        else:
+            self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
         TailableProc.start(self, stdin, stdout_redir=False, stderr_redir=stderr_redir)
         if wait_for_initialized:
             self.wait_for_log("Server started with public key")

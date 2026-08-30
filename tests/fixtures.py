@@ -18,6 +18,18 @@ def node_cls():
     return LightningNode
 
 
+@pytest.fixture(autouse=True)
+def vls_bitcoind_url(bitcoind):
+    # VLS import-farm: the proxy's chain follower needs a reachable
+    # bitcoind RPC; point it at this test run's bitcoind (pyln's fixed
+    # rpcuser/rpcpass creds) whenever SUBDAEMON routing is active.
+    # (no leading underscore: `from fixtures import *` must import it)
+    if os.environ.get("SUBDAEMON"):
+        os.environ['BITCOIND_RPC_URL'] = \
+            f"http://rpcuser:rpcpass@127.0.0.1:{bitcoind.rpcport}"
+    yield
+
+
 class LightningNode(utils.LightningNode):
     def __init__(self, *args, **kwargs):
         # Yes, we really want to test the local development version, not
@@ -29,6 +41,12 @@ class LightningNode(utils.LightningNode):
         if os.uname()[0] == 'Linux' and \
                 len(str(self.lightning_dir / TEST_NETWORK / 'lightning-rpc')) >= 108:
             self.daemon.opts['rpc-file'] = '/proc/self/cwd/lightning-rpc'
+
+        # VLS import-farm (vls-hsmd Makefile pattern): route every node's
+        # hsmd through $SUBDAEMON when set; unset = stock behavior.
+        subdaemon = os.environ.get("SUBDAEMON")
+        if subdaemon:
+            self.daemon.opts['subdaemon'] = subdaemon
 
         # This is a recent innovation, and we don't want to nail pyln-testing to this version.
         self.daemon.opts['dev-crash-after'] = 3600
