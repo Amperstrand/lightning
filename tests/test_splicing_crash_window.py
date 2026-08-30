@@ -90,14 +90,18 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
     print(f"OUTCOME: {outcome}", flush=True)
 
     # Durable evidence: full daemon logs survive teardown (pytest deletes
-    # passing-run test dirs).
+    # passing-run test dirs). UNIQUE per run: the fixed shared path was a
+    # cross-session contamination vector (a parallel invocation overwrote
+    # run 4's dumps mid-analysis — STATE.md "CROSS-RUN CONTAMINATION").
     import os
-    os.makedirs('/tmp/crash-window-logs', exist_ok=True)
-    with open('/tmp/crash-window-logs/l1.log', 'w') as f:
+    import time
+    dumpdir = f"/tmp/crash-window-logs-{int(time.time())}"
+    os.makedirs(dumpdir, exist_ok=True)
+    with open(dumpdir + '/l1.log', 'w') as f:
         f.write('\n'.join(l1.daemon.logs))
-    with open('/tmp/crash-window-logs/l2.log', 'w') as f:
+    with open(dumpdir + '/l2.log', 'w') as f:
         f.write('\n'.join(l2.daemon.logs))
-    print("LOGS: /tmp/crash-window-logs/{l1,l2}.log", flush=True)
+    print(f"LOGS: {dumpdir}/l1.log,l2.log", flush=True)
 
     # Evidence dump: the exchange-state markers from both sides.
     for name, node in (('l1', l1), ('l2', l2)):
