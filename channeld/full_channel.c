@@ -290,7 +290,11 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 }
 
 /* FIXME: We could cache these. */
-struct bitcoin_tx **channel_txs(const tal_t *ctx,
+/* fork-local (inr2-splice-harness): the feerate_override param powers the
+ * splice-resume fee-race retry in channeld — NULL means the historical
+ * behavior (the side's gated feerate). See
+ * docs/HACK-SPLICE-RESUME-FEE-RETRY.md in lightning-playground. */
+static struct bitcoin_tx **channel_txs_intl(const tal_t *ctx,
 				const struct bitcoin_outpoint *funding,
 				struct amount_sat funding_sats,
 				const struct htlc ***htlcmap,
@@ -303,7 +307,8 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 				s64 splice_amnt,
 				s64 remote_splice_amnt,
 				int *other_anchor_outnum,
-				const struct pubkey funding_pubkeys[NUM_SIDES])
+				const struct pubkey funding_pubkeys[NUM_SIDES],
+				const u32 *feerate_override)
 {
 	struct bitcoin_tx **txs;
 	const struct htlc **committed;
@@ -393,7 +398,8 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	    channel->config[!side].to_self_delay,
 	    channel->lease_expiry,
 	    channel_blockheight(channel, side),
-	    &keyset, channel_feerate(channel, side),
+	    &keyset,
+	    feerate_override ? *feerate_override : channel_feerate(channel, side),
 	    channel->config[side].dust_limit, side_pay,
 	    other_side_pay, committed, htlcmap, direct_outputs,
 	    commitment_number ^ channel->commitment_number_obscurer,
@@ -464,6 +470,54 @@ static bool get_room_above_reserve(const struct channel *channel,
 		return false;
 	}
 	return true;
+}
+
+struct bitcoin_tx **channel_txs(const tal_t *ctx,
+				const struct bitcoin_outpoint *funding,
+				struct amount_sat funding_sats,
+				const struct htlc ***htlcmap,
+				struct wally_tx_output *direct_outputs[NUM_SIDES],
+				const u8 **funding_wscript,
+				const struct channel *channel,
+				const struct pubkey *per_commitment_point,
+				u64 commitment_number,
+				enum side side,
+				s64 splice_amnt,
+				s64 remote_splice_amnt,
+				int *other_anchor_outnum,
+				const struct pubkey funding_pubkeys[NUM_SIDES])
+{
+	return channel_txs_intl(ctx, funding, funding_sats, htlcmap,
+				direct_outputs, funding_wscript, channel,
+				per_commitment_point, commitment_number, side,
+				splice_amnt, remote_splice_amnt,
+				other_anchor_outnum, funding_pubkeys, NULL);
+}
+
+/* fork-local: explicit-feerate variant for the splice-resume fee-race
+ * retry (channeld handle_peer_commit_sig). */
+struct bitcoin_tx **channel_txs_at_feerate(const tal_t *ctx,
+				const struct bitcoin_outpoint *funding,
+				struct amount_sat funding_sats,
+				const struct htlc ***htlcmap,
+				struct wally_tx_output *direct_outputs[NUM_SIDES],
+				const u8 **funding_wscript,
+				const struct channel *channel,
+				const struct pubkey *per_commitment_point,
+				u64 commitment_number,
+				enum side side,
+				s64 splice_amnt,
+				s64 remote_splice_amnt,
+				int *other_anchor_outnum,
+				const struct pubkey funding_pubkeys[NUM_SIDES],
+				const u32 *feerate_override)
+{
+	return channel_txs_intl(ctx, funding, funding_sats, htlcmap,
+				direct_outputs, funding_wscript, channel,
+				per_commitment_point, commitment_number, side,
+				splice_amnt, remote_splice_amnt,
+				other_anchor_outnum, funding_pubkeys,
+				feerate_override);
 }
 
 static size_t num_untrimmed_htlcs(enum side side,

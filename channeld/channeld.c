@@ -90,6 +90,12 @@ struct peer {
 
 	/* Local next per-commit point. */
 	struct pubkey next_local_per_commit;
+	/* fork-local: the point next_local_per_commit replaced at its last
+	 * rotation — the splice-resume retry axis (l1 may have missed the
+	 * revoke that announced the new point; see
+	 * docs/HACK-SPLICE-RESUME-FEE-RETRY.md). */
+	struct pubkey prev_local_per_commit;
+	bool have_prev_local_per_commit;
 
 	/* Remote's current per-commit point. */
 	struct pubkey remote_per_commit;
@@ -1672,6 +1678,19 @@ static void marshall_htlc_info(const tal_t *ctx,
 	}
 }
 
+/* fork-local: rotate next_local_per_commit, stashing the previous point
+ * for the splice-resume retry. */
+static void peer_set_local_per_commit(struct peer *peer,
+				      const struct pubkey *new_pc)
+{
+	if (peer->have_prev_local_per_commit
+	    && pubkey_eq(&peer->next_local_per_commit, new_pc))
+		return;
+	peer->prev_local_per_commit = peer->next_local_per_commit;
+	peer->have_prev_local_per_commit = true;
+	peer->next_local_per_commit = *new_pc;
+}
+
 static void send_revocation(struct peer *peer,
 			    const struct bitcoin_signature *commit_sig,
 			    const struct bitcoin_signature *htlc_sigs,
@@ -1727,8 +1746,12 @@ static void send_revocation(struct peer *peer,
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one. */
-	msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2,
-				  &peer->next_local_per_commit);
+	{
+		struct pubkey fork_new_pc;
+		msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2,
+					  &fork_new_pc);
+		peer_set_local_per_commit(peer, &fork_new_pc);
+	}
 
 	/* Now we can finally send revoke_and_ack to peer */
 	peer_write(peer->pps, take(msg));
@@ -6940,8 +6963,12 @@ static void init_channel(struct peer *peer)
 	assert(peer->next_index[LOCAL] > 0);
 	assert(peer->next_index[REMOTE] > 0);
 
-	get_per_commitment_point(peer->next_index[LOCAL],
-				 &peer->next_local_per_commit);
+	{
+		struct pubkey fork_new_pc;
+		get_per_commitment_point(peer->next_index[LOCAL],
+					 &fork_new_pc);
+		peer_set_local_per_commit(peer, &fork_new_pc);
+	}
 
 	peer->channel = new_full_channel(peer, &peer->channel_id,
 					 &funding,
