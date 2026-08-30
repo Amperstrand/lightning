@@ -35,6 +35,7 @@ class BitcoinRpcProxy(object):
     def _handle_request(self, r):
         brpc = BitcoinProxy(btc_conf_file=self.bitcoind.conf_file)
         method = r['method']
+        print(f"btcproxy request: {method}", flush=True)
 
         # If we have set a mock for this method reply with that instead of
         # forwarding the request.
@@ -81,7 +82,13 @@ class BitcoinRpcProxy(object):
 
     def start(self):
         d = PathInfoDispatcher({'/': self.app})
-        self.server = Server(('0.0.0.0', self.rpcport), d)
+        # numthreads=50: the default pool (10) exhausts under valgrind-slowed
+        # runs — getblock fetches for big regtest blocks each hold a thread
+        # for seconds; both nodes' polls + the block bursts queue behind them
+        # and the chain serving goes silent mid-run (the crash16 lockin stall:
+        # both nodes' last block ten minutes before the teardown while the
+        # test mined direct).
+        self.server = Server(('0.0.0.0', self.rpcport), d, numthreads=50)
         self.proxy_thread = threading.Thread(target=self.server.start)
         self.proxy_thread.daemon = True
         self.proxy_thread.start()
