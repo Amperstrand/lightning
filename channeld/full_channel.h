@@ -87,6 +87,24 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 				int *local_anchor_outnum,
 				const struct pubkey funding_pubkeys[NUM_SIDES]);
 
+/* fork-local: explicit-feerate variant for the splice-resume fee-race
+ * retry — see docs/HACK-SPLICE-RESUME-FEE-RETRY.md (lightning-playground). */
+struct bitcoin_tx **channel_txs_at_feerate(const tal_t *ctx,
+				const struct bitcoin_outpoint *funding,
+				struct amount_sat funding_sats,
+				const struct htlc ***htlcmap,
+				struct wally_tx_output *direct_outputs[NUM_SIDES],
+				const u8 **funding_wscript,
+				const struct channel *channel,
+				const struct pubkey *per_commitment_point,
+				u64 commitment_number,
+				enum side side,
+				s64 splice_amnt,
+				s64 remote_splice_amnt,
+				int *other_anchor_outnum,
+				const struct pubkey funding_pubkeys[NUM_SIDES],
+				const u32 *feerate_override);
+
 /**
  * actual_feerate: what is the actual feerate for the local side.
  * @channel: The channel state
