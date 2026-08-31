@@ -2,7 +2,7 @@ import time
 from fixtures import *  # noqa: F401,F403
 import pytest
 import unittest
-from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND
+from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, wait_for
 from utils import (
     TEST_NETWORK
 )
