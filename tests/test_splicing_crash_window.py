@@ -1,5 +1,6 @@
 import time
 from fixtures import *  # noqa: F401,F403
+from fixtures import assert_progress
 import pytest
 import unittest
 import time
@@ -11,6 +12,12 @@ from utils import (
 
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
+# xfail STRICT on purpose: the wedge is the known upstream bug (#87,
+# pristine-confirmed 2/2 on v26.06.6). assert_progress fails the test
+# while the wedge exists; when upstream lands a recovery fix this
+# flips to XPASS and FAILS the suite — the alarm that the bug is gone
+# and the xfail must be removed.
+@pytest.mark.xfail(strict=True, reason="known wedge #87: pre-tx_signatures crash leaves both peers in CHANNELD_AWAITING_SPLICE forever, no tx_abort/timeout/re-drive (pristine v26.06.6 2/2; evidence test-artifacts/vls-splice-gates-20260830/crash-window/)")
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
 def test_splice_crash_window(node_factory, bitcoind, executor):
     """Stock repro probe for the VLS splice crash-resume rejection loop.
@@ -89,6 +96,18 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
         time.sleep(1)
 
     print(f"OUTCOME: {outcome}", flush=True)
+
+    # The wedge assertion (call phase so the xfail above can catch it):
+    # a quiet stall in a transient channel state FAILS this test.
+    # Threshold clamped to 30s: the 60s classification loop already
+    # proved no outcome movement; channeld lines landing early in the
+    # loop would leave <60s of quiet at assert time and flip the
+    # strict xfail to a false XPASS.
+    if outcome == 'NO-CONVERGENCE-60s (the quiet stall)':
+        time.sleep(1)  # let any in-flight channeld line land first
+        import fixtures as _fx
+        _fx.WATCHDOG_QUIET_SECONDS = 30
+        assert_progress([l1, l2])
 
     # Durable evidence: full daemon logs survive teardown (pytest deletes
     # passing-run test dirs). UNIQUE per run: the fixed shared path was a
