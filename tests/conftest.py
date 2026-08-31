@@ -26,6 +26,8 @@ def pytest_configure(config):
                             "slow_test: slow tests aren't run under Valgrind")
     config.addinivalue_line("markers",
                             "openchannel: Limit this test to only run 'v1' or 'v2' openchannel protocol")
+    config.addinivalue_line("markers",
+                            "progress_watchdog: fail at teardown if channels sit in a transient state (default CHANNELD_AWAITING_SPLICE) with no channeld/connectd activity for WATCHDOG_QUIET_SECONDS")
 
 
 def pytest_runtest_setup(item):

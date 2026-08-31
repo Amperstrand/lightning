@@ -6,7 +6,12 @@ The injection rides a pytest-level env var consumed by a conftest shim
 (chaos_conftest); the driver records pass/fail/timeout per iteration.
 
 Usage:
-  python3 tests/splice_chaos.py [iterations] [seed]
+  python3 tests/splice_chaos.py [iterations] [seed] [--stock]
+
+--stock runs the sweep on the cln:native arm (stock hsmd). The default
+arm is cln:socket (VLS via the counter wrapper) as before; every run is
+arm-verified from its banner (#83: the p8 sweep was all-VLS while its
+labels said stock — the conclusions had to be retracted).
 """
 import os
 import random
@@ -34,22 +39,33 @@ MESSAGES = [
 def main():
     iters = int(sys.argv[1]) if len(sys.argv) > 1 else 16
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 42
+    stock = "--stock" in sys.argv[3:]
+    arm = "cln:native" if stock else "cln:socket"
     rng = random.Random(seed)
     tree = os.path.expanduser("~/src/vls-splice/lightning")
     env = dict(os.environ)
     env.update({
         "VALGRIND": "0", "DEVELOPER": "1", "PYTHONUNBUFFERED": "1",
-        "SUBDAEMON": "hsmd:/tmp/p2inst/vls-proxy-wrapper-counter.sh",
-        # The harness env (env.sh semantics) — the wrapper needs the
-        # BINARY's own version string (env.sh derives it the same way).
-        "VLS_CLN_VERSION": subprocess.run(
-            [os.path.join(tree, "lightningd/lightningd"), "--version"],
-            capture_output=True, text=True).stdout.strip(),
-        "VLS_NETWORK": "regtest",
-        "VLS_PERMISSIVE": "1",
-        "BITCOIND_RPC_URL": "http://user:pass@127.0.0.1:18443",
+        "VLS_MODE": arm,
+        "WATCHDOG": "1",
+        "WATCHDOG_QUIET_SECONDS": "90",
         "TIMEOUT": "180",
     })
+    if stock:
+        env.pop("SUBDAEMON", None)
+        env.pop("VLS_AUTOAPPROVE", None)
+    else:
+        env.update({
+            "SUBDAEMON": "hsmd:/tmp/p2inst/vls-proxy-wrapper-counter.sh",
+            # The harness env (env.sh semantics) — the wrapper needs the
+            # BINARY's own version string (env.sh derives it the same way).
+            "VLS_CLN_VERSION": subprocess.run(
+                [os.path.join(tree, "lightningd/lightningd"), "--version"],
+                capture_output=True, text=True).stdout.strip(),
+            "VLS_NETWORK": "regtest",
+            "VLS_PERMISSIVE": "1",
+            "BITCOIND_RPC_URL": "http://user:pass@127.0.0.1:18443",
+        })
     results = {"PASS": 0, "FAIL": 0, "TIMEOUT": 0}
     fails = []
     for i in range(iters):
@@ -67,6 +83,13 @@ def main():
                 env=env, cwd=tree, capture_output=True, text=True, timeout=300,
             )
             out = r.stdout + r.stderr
+            banners = [l for l in out.splitlines() if l.startswith("VLS ARM:")]
+            banner = banners[0] if banners else "VLS ARM: <ABSENT>"
+            if f"VLS ARM: {arm} " not in banner + " ":
+                results["FAIL"] += 1
+                fails.append((tag, f"arm mismatch: wanted {arm}, run said '{banner}'"))
+                print(f"{tag}: FAIL — arm mismatch: '{banner}'", flush=True)
+                continue
             summary = [l for l in out.splitlines()
                        if " passed" in l or " failed" in l]
             summary_line = summary[-1] if summary else ""
@@ -82,7 +105,7 @@ def main():
             results["TIMEOUT"] += 1
             fails.append((tag, "HARD TIMEOUT"))
             print(f"{tag}: TIMEOUT", flush=True)
-    print(f"\n=== CHAOS SUMMARY (seed {seed}): PASS={results['PASS']} "
+    print(f"\n=== CHAOS SUMMARY (seed {seed}, arm {arm}): PASS={results['PASS']} "
           f"FAIL={results['FAIL']} TIMEOUT={results['TIMEOUT']}", flush=True)
     for tag, why in fails:
         print(f"  {tag}: {why}", flush=True)
