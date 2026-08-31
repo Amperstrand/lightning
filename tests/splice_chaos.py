@@ -78,7 +78,7 @@ def main():
         try:
             r = subprocess.run(
                 [os.path.join(tree, ".venv/bin/python"), "-m", "pytest",
-                 test, "-q", "-x", "--timeout=200",
+                 test, "-q", "-x", "-s", "--timeout=200",
                  "-p", "tests.chaos_plugin"],
                 env=env, cwd=tree, capture_output=True, text=True, timeout=300,
             )
