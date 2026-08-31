@@ -12,6 +12,32 @@ import subprocess
 import tempfile
 import time
 
+from datetime import datetime, timezone
+
+
+def _vls_arm():
+    """vls-hsmd VLS_MODE pattern: the arm switch lives in the fixtures,
+    not in launcher scripts. cln:native forces stock hsmd even if
+    SUBDAEMON leaked into the env (the #83 class — a "STOCK" run was
+    actually VLS-signed and filed a wrong upstream candidate);
+    cln:socket routes hsmd through $SUBDAEMON. Default derives from
+    SUBDAEMON presence so legacy flows keep their old behavior."""
+    mode = os.environ.get('VLS_MODE') or (
+        'cln:socket' if os.environ.get('SUBDAEMON') else 'cln:native')
+    if mode not in ('cln:native', 'cln:socket'):
+        raise ValueError(
+            f"VLS_MODE={mode!r}: expected 'cln:native' or 'cln:socket'")
+    return mode
+
+
+VLS_ARM = _vls_arm()
+# The banner is the machine-checkable arm signature every run log
+# carries; splice-dev/bin/verify-arm.sh fails a run whose log contradicts
+# the declared arm.
+print(f"VLS ARM: {VLS_ARM} "
+      + ("(VLS signer via SUBDAEMON)" if VLS_ARM == 'cln:socket'
+         else "(stock hsmd; SUBDAEMON ignored)"), flush=True)
+
 
 @pytest.fixture
 def node_cls():
@@ -22,9 +48,9 @@ def node_cls():
 def vls_bitcoind_url(bitcoind):
     # VLS import-farm: the proxy's chain follower needs a reachable
     # bitcoind RPC; point it at this test run's bitcoind (pyln's fixed
-    # rpcuser/rpcpass creds) whenever SUBDAEMON routing is active.
+    # rpcuser/rpcpass creds) whenever the socket arm is routing.
     # (no leading underscore: `from fixtures import *` must import it)
-    if os.environ.get("SUBDAEMON"):
+    if VLS_ARM == 'cln:socket' and os.environ.get("SUBDAEMON"):
         os.environ['BITCOIND_RPC_URL'] = \
             f"http://rpcuser:rpcpass@127.0.0.1:{bitcoind.rpcport}"
     yield
@@ -43,9 +69,10 @@ class LightningNode(utils.LightningNode):
             self.daemon.opts['rpc-file'] = '/proc/self/cwd/lightning-rpc'
 
         # VLS import-farm (vls-hsmd Makefile pattern): route every node's
-        # hsmd through $SUBDAEMON when set; unset = stock behavior.
+        # hsmd through $SUBDAEMON on the socket arm; native arm ignores a
+        # leaked SUBDAEMON (defense in depth — env.sh also unsets it).
         subdaemon = os.environ.get("SUBDAEMON")
-        if subdaemon:
+        if subdaemon and VLS_ARM == 'cln:socket':
             self.daemon.opts['subdaemon'] = subdaemon
 
         # This is a recent innovation, and we don't want to nail pyln-testing to this version.
@@ -195,9 +222,9 @@ def tcp_capture(tmp_path):
     # You will need permissions.  Most distributions have a group which has
     # permissions to use dumpcap:
     #     $ ls -l /usr/bin/dumpcap
-    #     -rwxr-xr-- 1 root wireshark 229112 Apr 16  2024 /usr/bin/dumpcap
+    #     -rwxr-xr-- 1 root wireshark 209112 Apr 16  2024 /usr/bin/dumpcap
     #     $ getcap /usr/bin/dumpcap
-    #     /usr/bin/dumpcap cap_net_admin,cap_net_raw=eip
+    #     /usr/bin/dumpcap cap_net_admin,cap_net_raw=e1,eip
     # So you just need to be in the wireshark group.
     if not dumpcap_usable():
         pytest.skip("dumpcap/tshark not available or insufficient privileges")
@@ -206,3 +233,74 @@ def tcp_capture(tmp_path):
     yield cap
     cap.stop()
     cap.assert_constant_payload()
+
+
+# --- progress watchdog: silent wedges must fail, not pass quietly -----
+# Earned by #87: the crash-window wedge is SILENT (gossip-only logs, no
+# error, no timeout) — a test can observe it and still pass. The watchdog
+# fails a run whose channels sit in a transient state (default
+# CHANNELD_AWAITING_SPLICE) with zero channeld/connectd activity for
+# WATCHDOG_QUIET_SECONDS (default 60).
+
+WATCHDOG_TRANSIENT_STATES = [
+    s for s in os.environ.get('WATCHDOG_TRANSIENT_STATES',
+                              'CHANNELD_AWAITING_SPLICE').split(',') if s]
+WATCHDOG_QUIET_SECONDS = float(os.environ.get('WATCHDOG_QUIET_SECONDS', '60'))
+_WATCHDOG_PROTO_MARKERS = ('-channeld-chan#', 'connectd: peer_')
+_WATCHDOG_TS = re.compile(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z')
+
+
+def _watchdog_enabled(request):
+    if os.environ.get('WATCHDOG') == '1':
+        return True
+    return request.node.get_closest_marker('progress_watchdog') is not None
+
+
+def _watchdog_last_activity(nodes):
+    """Latest channeld/connectd log timestamp across the given nodes
+    (None if no protocol activity was ever logged)."""
+    last = None
+    for node in nodes:
+        for line in node.daemon.logs:
+            if any(m in line for m in _WATCHDOG_PROTO_MARKERS):
+                m = _WATCHDOG_TS.search(line)
+                if m:
+                    last = max(last, m.group(1)) if last else m.group(1)
+    return last
+
+
+def assert_progress(nodes):
+    """Call-phase wedge assertion (for xfail-wrapped probes where a
+    teardown-phase failure would escape the xfail marker). Same rule as
+    the progress_watchdog fixture: channels in a transient state must
+    show channeld/connectd activity within WATCHDOG_QUIET_SECONDS."""
+    for node in nodes:
+        try:
+            channels = node.rpc.listpeerchannels()['channels']
+        except Exception:
+            continue  # deliberately stopped/killed node: legal end state
+        states = [c.get('state') for c in channels]
+        if not [s for s in states if s in WATCHDOG_TRANSIENT_STATES]:
+            continue
+        last = _watchdog_last_activity([node])
+        if last is not None:
+            ts = datetime.strptime(last, '%Y-%m-%dT%H:%M:%S.%f'
+                                   ).replace(tzinfo=timezone.utc)
+            quiet = time.time() - ts.timestamp()
+            if quiet < WATCHDOG_QUIET_SECONDS:
+                continue
+        pytest.fail(
+            f"progress watchdog: {str(node.lightning_dir)} wedged: "
+            f"states={states}, no channeld/connectd activity for "
+            f"{WATCHDOG_QUIET_SECONDS:.0f}s (last={last})")
+
+
+@pytest.fixture
+def progress_watchdog(request, node_factory):
+    """Automatic teardown-phase wedge check. Depends on node_factory so
+    its finalizer runs while the nodes are still alive. Opt in per test
+    with @pytest.mark.progress_watchdog, or globally with WATCHDOG=1."""
+    yield
+    if not _watchdog_enabled(request):
+        return
+    assert_progress(node_factory.nodes)
