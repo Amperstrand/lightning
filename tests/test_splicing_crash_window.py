@@ -1,9 +1,7 @@
 import time
 from fixtures import *  # noqa: F401,F403
-from fixtures import assert_progress
 import pytest
 import unittest
-import time
 from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND
 from utils import (
     TEST_NETWORK
@@ -12,15 +10,10 @@ from utils import (
 
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
-# xfail STRICT on purpose: the wedge is the known upstream bug (#87,
-# pristine-confirmed 2/2 on v26.06.6). assert_progress fails the test
-# while the wedge exists; when upstream lands a recovery fix this
-# flips to XPASS and FAILS the suite — the alarm that the bug is gone
-# and the xfail must be removed.
-@pytest.mark.xfail(strict=True, reason="known wedge #87: pre-tx_signatures crash leaves both peers in CHANNELD_AWAITING_SPLICE forever, no tx_abort/timeout/re-drive (pristine v26.06.6 2/2; evidence test-artifacts/vls-splice-gates-20260830/crash-window/)")
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
 def test_splice_crash_window(node_factory, bitcoind, executor):
-    """Stock repro probe for the VLS splice crash-resume rejection loop.
+    """Crash-window splice resume, with the convergence window able to
+    converge.
 
     Injects the VLS crash knowledge state deterministically: l1's
     second-update commitment_signed is SIGNED by channeld but the wire
@@ -29,12 +22,13 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
     but the message never reached l2. l1 is then killed and restarted,
     exactly like test_commit_crash_splice.
 
-    Outcome classification (all three are legitimate results):
-      RESUME-COMPLETE  -- stock retransmission realigns, splice lives
-      TX_ABORT-RESCUE  -- stock abandons the splice (disconnect_commit's
-                          designed rescue)
-      LOOP             -- repeated 'Bad commit_sig' rejections: the VLS
-                          behavior reproduced on STOCK (the filing repro)
+    The R28 correction (2026-08-31): the original 60s classification
+    window never mined blocks, so RESUME-COMPLETE was unreachable dead
+    code and every healthy run classified as NO-CONVERGENCE — the "wedge"
+    (#87, RETRACTED) was a test-design artifact. The reestablished splice
+    is awaiting CONFIRMATION, not stuck: with blocks mined after the
+    reestablish, the channel must reach NORMAL on both sides and carry a
+    post-splice payment. Proof: wedge-retraction-proof.log (30.65s).
     """
     # Model the flow on test_splice_rbf (the verified baseline): splice out,
     # output-only psbt. l1's commitment_signed sends: [dual-fund: channel-open
@@ -77,37 +71,35 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
     l1.start()
 
     l1.daemon.wait_for_log(r'peer_in WIRE_CHANNEL_REESTABLISH')
+    l2.daemon.wait_for_log(r'peer_in WIRE_CHANNEL_REESTABLISH')
     print("PHASE4: reestablished", flush=True)
 
-    # Classification window.
-    deadline = time.time() + 60
-    outcome = 'NO-CONVERGENCE-60s (the quiet stall)'
-    while time.time() < deadline:
-        if l2.daemon.is_in_log(r'Bad commit_sig') or l1.daemon.is_in_log(r'Bad commit_sig'):
-            outcome = 'LOOP (Bad commit_sig — the rejection loop)'
-            break
-        if (l1.daemon.is_in_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL')
-                and l2.daemon.is_in_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL')):
-            outcome = 'RESUME-COMPLETE'
-            break
-        if (l1.daemon.is_in_log(r'TX_ABORT') or l2.daemon.is_in_log(r'TX_ABORT')):
-            outcome = 'TX_ABORT-RESCUE'
-            break
-        time.sleep(1)
+    # THE CORRECTION STEP (R28): the resumed splice is a real inflight
+    # awaiting confirmation — the exchange completes at reestablish and
+    # the splice tx lands in the mempool. A window that never mines
+    # classifies healthy runs as wedged (dead-code criteria).
+    wait_for(lambda: len(list(bitcoind.rpc.getrawmempool(True).keys())) >= 1)
+    print("PHASE5: splice tx in mempool, mining 6 blocks", flush=True)
+    bitcoind.generate_block(6, wait_for_mempool=1)
 
-    print(f"OUTCOME: {outcome}", flush=True)
+    # Convergence is now REACHABLE and REQUIRED: both sides NORMAL.
+    l1.daemon.wait_for_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL', 30)
+    l2.daemon.wait_for_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL', 30)
+    print("OUTCOME: RESUME-COMPLETE with mining — R28 correction verified", flush=True)
 
-    # The wedge assertion (call phase so the xfail above can catch it):
-    # a quiet stall in a transient channel state FAILS this test.
-    # Threshold clamped to 30s: the 60s classification loop already
-    # proved no outcome movement; channeld lines landing early in the
-    # loop would leave <60s of quiet at assert time and flip the
-    # strict xfail to a false XPASS.
-    if outcome == 'NO-CONVERGENCE-60s (the quiet stall)':
-        time.sleep(1)  # let any in-flight channeld line land first
-        import fixtures as _fx
-        _fx.WATCHDOG_QUIET_SECONDS = 30
-        assert_progress([l1, l2])
+    # Full end-to-end proof: post-splice payment, no unilateral close.
+    inv = l2.rpc.invoice(10**2, 'c1', 'crash_window')
+    l1.rpc.xpay(inv['bolt11'])
+    time.sleep(5)
+    assert l1.db_query("SELECT count(*) as c FROM channeltxs;")[0]['c'] == 0
+    print("OUTCOME: post-splice payment OK, no unilateral close", flush=True)
+
+    # A genuine rejection loop ('Bad commit_sig' — the VLS crash-resume
+    # class this test was born to catch) fails the convergence assert
+    # above by timeout; surface it in the log for triage.
+    for name, node in (('l1', l1), ('l2', l2)):
+        if node.daemon.is_in_log(r'Bad commit_sig'):
+            print(f"TRIAGE: {name} hit 'Bad commit_sig' — the rejection-loop class", flush=True)
 
     # Durable evidence: full daemon logs survive teardown (pytest deletes
     # passing-run test dirs). UNIQUE per run: the fixed shared path was a
@@ -121,20 +113,3 @@ def test_splice_crash_window(node_factory, bitcoind, executor):
     with open(dumpdir + '/l2.log', 'w') as f:
         f.write('\n'.join(l2.daemon.logs))
     print(f"LOGS: {dumpdir}/l1.log,l2.log", flush=True)
-
-    # Evidence dump: the exchange-state markers from both sides.
-    for name, node in (('l1', l1), ('l2', l2)):
-        logs = node.daemon.logs
-        markers = [l for l in logs if 'handle_peer_commit_sig(' in l
-                   or 'Splice initiator' in l
-                   or 'Bad commit_sig' in l
-                   or 'TX_ABORT' in l
-                   or 'dev_disconnect' in l
-                   or 'reestablish' in l.lower()]
-        print(f"=== {name} markers ({len(markers)}):", flush=True)
-        for m in markers[-25:]:
-            print(f"  {m}", flush=True)
-
-    # Final channel state for the record.
-    print(f"PEERSTATE l1: {l1.rpc.listpeerchannels()['channels'][0]['state'] if l1.rpc.listpeerchannels()['channels'] else 'none'}", flush=True)
-    print(f"PEERSTATE l2: {l2.rpc.listpeerchannels()['channels'][0]['state'] if l2.rpc.listpeerchannels()['channels'] else 'none'}", flush=True)
