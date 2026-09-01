@@ -3220,6 +3220,45 @@ def test_utxopsbt_emergency_reserve_existing_change_covers(node_factory,
     assert l1.rpc.getinfo()['id']
 
 
+def test_fundpsbt_emergency_no_reselection(node_factory, bitcoind,
+                                           chainparams):
+    """Known completeness boundary (pre-9455 and unchanged by the
+    roundup): fundpsbt's coin selection stops as soon as the ASKED
+    amount plus fees is covered — the emergency top-up is checked only
+    afterwards and never triggers selecting another UTXO.  Here the
+    minimal selection leaves 307 sat of excess, four short of the 374
+    roundup cost, and the call refuses with 313 even though the second
+    (1-conf) UTXO could have funded the change.  Selection-retry is a
+    possible future improvement, not part of the reserve fix."""
+    if chainparams['elements']:
+        pytest.skip("exact fixtures are Bitcoin-P2TR-tuned")
+    emergency_sat = 25_000
+    l1 = node_factory.get_node(
+        options={'min-emergency-msat': emergency_sat * 1000})
+
+    def fund(sats):
+        addr = l1.rpc.newaddr('bech32')['bech32']
+        txid = bitcoind.rpc.sendtoaddress(addr, sats / 10**8)
+        vout = bitcoind.rpc.gettransaction(txid)['details'][0]['vout']
+        return '{}:{}'.format(txid, vout)
+
+    fund(60_000)
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 1)
+    fund(24_900)  # 1 conf: selectable only without minconf=2
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 2)
+
+    # excess 307 < roundup cost 374 -> typed refusal (no re-selection)
+    with pytest.raises(RpcError, match='min-emergency-msat'):
+        l1.rpc.call('fundpsbt', {
+            'satoshi': '59600sat', 'feerate': '253perkw',
+            'startweight': 100, 'reserve': 0, 'minconf': 2,
+            'excess_as_change': False, 'opening_anchor_channel': True})
+
+    assert l1.rpc.getinfo()['id']
+
+
 def test_fundpsbt_emergency_reserve_dust_shortfall(node_factory, bitcoind,
                                                     chainparams):
     """Same dust-shortfall window as the utxopsbt test, reached through
