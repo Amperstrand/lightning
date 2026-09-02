@@ -1370,6 +1370,84 @@ static void send_message_batch(struct peer *peer, u8 **msgs)
 	peer_write(peer->pps, take(final_msg));
 }
 
+/* fork #125: frame/unframe a batch of wire messages for durable storage:
+ * u16 count, then per message u32 length + bytes. */
+static u8 *frame_msg_batch(const tal_t *ctx, const u8 *const *msgs,
+			   size_t num_msgs)
+{
+	u8 *blob = tal_arr(ctx, u8, 0);
+	size_t i;
+
+	towire_u16(&blob, num_msgs);
+	for (i = 0; i < num_msgs; i++) {
+		towire_u32(&blob, tal_bytelen(msgs[i]));
+		towire_u8_array(&blob, msgs[i], tal_bytelen(msgs[i]));
+	}
+	return blob;
+}
+
+static u8 **unframe_msg_batch(const tal_t *ctx, const u8 *blob, size_t blob_len)
+{
+	const u8 *cursor = blob;
+	size_t max = blob_len;
+	u16 count, i;
+	u8 **msgs;
+
+	count = fromwire_u16(&cursor, &max);
+	msgs = tal_arr(ctx, u8 *, count);
+	for (i = 0; i < count; i++) {
+		u32 mlen = fromwire_u32(&cursor, &max);
+		if (mlen > max)
+			return tal_free(msgs);
+		msgs[i] = tal_arr(msgs, u8, mlen);
+		fromwire_u8_array(&cursor, &max, msgs[i], mlen);
+	}
+	if (max != 0)
+		return tal_free(msgs);
+	return msgs;
+}
+
+/* fork #125: persist the exact commitment_signed bytes BEFORE the wire
+ * write — the splice resume must replay these, never re-sign: rebuilds
+ * drift (changed fee/view set) and a validating signer refuses the
+ * same-number reshuffle (the R7.2 retransmit contract). */
+static void store_sent_commitsigs(struct peer *peer,
+				  u64 commitnum,
+				  const u8 *const *msgs,
+				  size_t num_msgs)
+{
+	u8 *blob = frame_msg_batch(tmpctx, msgs, num_msgs);
+	u8 *msg = towire_channeld_store_sent_commitsig(NULL, commitnum, blob);
+	master_wait_sync_reply(tmpctx, peer, take(msg),
+			       WIRE_CHANNELD_STORE_SENT_COMMITSIG_REPLY);
+}
+
+/* fork #125 resume: REPLAY the durably stored commitment_signed batch
+ * for this number. Returns true if we replayed. */
+static bool maybe_replay_commitments(struct peer *peer, u64 commitnum)
+{
+	u8 *msg, *reply;
+	u64 num;
+	u8 *blob;
+	u8 **stored;
+
+	msg = towire_channeld_fetch_sent_commitsig(NULL, commitnum);
+	reply = master_wait_sync_reply(tmpctx, peer, take(msg),
+				       WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT);
+	if (!fromwire_channeld_fetch_sent_commitsig_result(tmpctx, reply,
+							   &num, &blob))
+		master_badmsg(WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT, reply);
+	if (num != commitnum || !blob || tal_bytelen(blob) == 0)
+		return false;
+	stored = unframe_msg_batch(tmpctx, blob, tal_bytelen(blob));
+	if (!stored || tal_count(stored) == 0)
+		return false;
+	status_debug("Splice resume: replaying %zu stored commitment_signed "
+		     "msgs at num %"PRIu64, tal_count(stored), commitnum);
+	send_message_batch(peer, stored);
+	return true;
+}
+
 static void send_commit(struct peer *peer)
 {
 	const struct htlc **changed_htlcs;
@@ -1533,6 +1611,11 @@ static void send_commit(struct peer *peer)
 	msg = towire_channeld_local_anchor_info(NULL, peer->next_index[REMOTE],
 						anchors_info);
 	wire_sync_write(MASTER_FD, take(msg));
+
+	/* fork #125: persist the exact bytes before the wire write (the
+	 * index these msgs were built at is the pre-increment value). */
+	store_sent_commitsigs(peer, peer->next_index[REMOTE],
+			      (const u8 *const *)msgs, tal_count(msgs));
 
 	peer->next_index[REMOTE]++;
 
@@ -3119,6 +3202,7 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 						      size_t inflight_index,
 						      bool send_commitments,
 						      bool recv_commitments,
+						      bool resuming,
 						      const u8 **msg_received,
 						      int allowed_premature_msg)
 {
@@ -3145,18 +3229,29 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 			     our_role == TX_INITIATOR ? "initiator" : "accepter",
 			     next_index_local, next_index_remote);
 
-		peer_write(peer->pps, send_commit_part(tmpctx,
-						       peer,
-						       &inflight->outpoint,
-						       inflight->amnt,
-						       NULL, false,
-						       inflight->splice_amnt,
-						       remote_splice_amnt,
-						       next_index_remote - 1,
-						       &peer->old_remote_per_commit,
-						       &local_anchor,
-						       1,
-						       inflight->remote_funding));
+		/* fork #125: on resume, REPLAY the durably stored bytes
+		 * instead of re-signing (rebuilds drift; a validating
+		 * signer refuses the same-number reshuffle). */
+		if (!resuming
+		    || !maybe_replay_commitments(peer, next_index_remote - 1)) {
+			u8 *csmsg = send_commit_part(tmpctx,
+						     peer,
+						     &inflight->outpoint,
+						     inflight->amnt,
+						     NULL, false,
+						     inflight->splice_amnt,
+						     remote_splice_amnt,
+						     next_index_remote - 1,
+						     &peer->old_remote_per_commit,
+						     &local_anchor,
+						     1,
+						     inflight->remote_funding);
+			const u8 *one[1];
+			one[0] = csmsg;
+			store_sent_commitsigs(peer, next_index_remote - 1,
+					      one, 1);
+			peer_write(peer->pps, csmsg);
+		}
 	}
 
 	result = NULL;
@@ -3221,18 +3316,29 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 			     our_role == TX_INITIATOR ? "initiator" : "accepter",
 			     next_index_local, next_index_remote);
 
-		peer_write(peer->pps, send_commit_part(tmpctx,
-						       peer,
-						       &inflight->outpoint,
-						       inflight->amnt,
-						       NULL, false,
-						       inflight->splice_amnt,
-						       remote_splice_amnt,
-						       next_index_remote - 1,
-						       &peer->old_remote_per_commit,
-						       &local_anchor,
-						       1,
-						       inflight->remote_funding));
+		/* fork #125: on resume, REPLAY the durably stored bytes
+		 * instead of re-signing (rebuilds drift; a validating
+		 * signer refuses the same-number reshuffle). */
+		if (!resuming
+		    || !maybe_replay_commitments(peer, next_index_remote - 1)) {
+			u8 *csmsg = send_commit_part(tmpctx,
+						     peer,
+						     &inflight->outpoint,
+						     inflight->amnt,
+						     NULL, false,
+						     inflight->splice_amnt,
+						     remote_splice_amnt,
+						     next_index_remote - 1,
+						     &peer->old_remote_per_commit,
+						     &local_anchor,
+						     1,
+						     inflight->remote_funding);
+			const u8 *one[1];
+			one[0] = csmsg;
+			store_sent_commitsigs(peer, next_index_remote - 1,
+					      one, 1);
+			peer_write(peer->pps, csmsg);
+		}
 	}
 
 	/* Sending and receiving splice commit should not increment commit
@@ -3801,6 +3907,7 @@ static void resume_splice_negotiation(struct peer *peer,
 				      bool recv_commitments,
 				      bool send_signature,
 				      bool recv_signature,
+				      bool resuming,
 				      int allowed_premature_msg)
 {
 	struct inflight *inflight = last_inflight(peer);
@@ -3860,6 +3967,7 @@ static void resume_splice_negotiation(struct peer *peer,
 						    last_inflight_index(peer),
 						    send_commitments,
 						    recv_commitments,
+						    resuming,
 						    &msg_received,
 						    allowed_premature_msg);
 
@@ -4422,7 +4530,7 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 
 	peer->splice_state->count++;
 
-	resume_splice_negotiation(peer, true, true, true, true, 0);
+	resume_splice_negotiation(peer, true, true, true, true, false, 0);
 }
 
 /* splice_initiator runs when splice_ack is received by the other side. It
@@ -4728,7 +4836,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	their_commit = interactive_send_commitments(peer, new_inflight->psbt,
 						    our_role,
 						    last_inflight_index(peer),
-						    true, true, NULL, 0);
+						    true, true, false, NULL, 0);
 
 	new_inflight->last_tx = tal_steal(new_inflight, their_commit->tx);
 	new_inflight->last_sig = their_commit->commit_signature;
@@ -4744,7 +4852,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 				     peer->splicing->force_sign_first);
 
 	if (!sign_first)
-		resume_splice_negotiation(peer, false, false, false, true, 0);
+		resume_splice_negotiation(peer, false, false, false, true, false, 0);
 
 	outmsg = towire_channeld_splice_confirmed_update(NULL,
 							 new_inflight->psbt,
@@ -4945,7 +5053,7 @@ static void splice_initiator_user_signed(struct peer *peer, const u8 *inmsg)
 	audit_psbt(inflight->psbt, inflight->psbt);
 	assert(tal_parent(inflight->psbt) != tmpctx);
 
-	resume_splice_negotiation(peer, false, false, true, sign_first, 0);
+	resume_splice_negotiation(peer, false, false, true, sign_first, false, 0);
 
 	audit_psbt(inflight->psbt, inflight->psbt);
 	assert(tal_parent(inflight->psbt) != tmpctx);
@@ -5927,6 +6035,7 @@ static void peer_reconnect(struct peer *peer,
 						  !inflight->last_tx,
 						  false,
 						  true,
+						  true,
 						  WIRE_CHANNEL_READY);
 		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
 					   &inflight->outpoint.txid)) {
@@ -5944,6 +6053,7 @@ static void peer_reconnect(struct peer *peer,
 						  local_next_funding && !inflight->last_tx,
 						  true,
 						  local_next_funding,
+						  true,
 						  WIRE_CHANNEL_READY);
 		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
 					   &peer->channel->funding.txid)) {
@@ -6772,6 +6882,10 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_SPLICE_CONFIRMED_UPDATE:
 	case WIRE_CHANNELD_SPLICE_LOOKUP_TX:
 	case WIRE_CHANNELD_SPLICE_LOOKUP_TX_RESULT:
+	case WIRE_CHANNELD_STORE_SENT_COMMITSIG:
+	case WIRE_CHANNELD_STORE_SENT_COMMITSIG_REPLY:
+	case WIRE_CHANNELD_FETCH_SENT_COMMITSIG:
+	case WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT:
 	case WIRE_CHANNELD_SPLICE_FEERATE_ERROR:
 	case WIRE_CHANNELD_SPLICE_FUNDING_ERROR:
 	case WIRE_CHANNELD_SPLICE_ABORT:

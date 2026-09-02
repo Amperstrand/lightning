@@ -685,6 +685,15 @@ void wallet_inflight_del(struct wallet *w, const struct channel *chan,
 /**
  * Update an existing inflight channel transaction
  */
+/* fork #125: the last-signed commitment_signed batch per channel (the
+ * splice crash-resume replays these bytes instead of re-signing). */
+void wallet_sent_commitsig_save(struct wallet *w,
+				u64 dbid,
+				u64 commitnum,
+				const u8 *batch, size_t batch_len);
+const u8 *wallet_sent_commitsig_get(const tal_t *ctx, struct wallet *w,
+				    u64 dbid, u64 *commitnum);
+
 void wallet_inflight_save(struct wallet *w,
 			  struct channel_inflight *inflight);
 

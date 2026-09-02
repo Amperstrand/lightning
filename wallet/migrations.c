@@ -1085,6 +1085,19 @@ static const struct db_migration dbmigrations[] = {
     {SQL("ALTER TABLE offers ADD COLUMN force_paths INTEGER DEFAULT 0;"), NULL,
      SQL("ALTER TABLE offers DROP COLUMN force_paths"), NULL},
     /* ^v26.04 */
+
+    /* fork (inr2-splice-harness) #125: durable storage for the exact
+     * commitment_signed bytes signed during splice rounds; the crash
+     * resume replays them instead of re-signing (the R7.2 retransmit
+     * contract; lightning-playground #125/#116). */
+    {SQL("CREATE TABLE sent_commitsigs ("
+	 "  channel_id BIGINT NOT NULL"
+	 ", commitnum BIGINT NOT NULL"
+	 ", batch BLOB"
+	 ", PRIMARY KEY (channel_id)"
+	 ")"),
+     NULL,
+     SQL("DROP TABLE sent_commitsigs"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

@@ -1623,6 +1623,49 @@ void wallet_inflight_save(struct wallet *w,
 	db_exec_prepared_v2(take(stmt));
 }
 
+void wallet_sent_commitsig_save(struct wallet *w,
+				u64 dbid,
+				u64 commitnum,
+				const u8 *batch, size_t batch_len)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db,
+			     SQL("INSERT INTO sent_commitsigs"
+				 " (channel_id, commitnum, batch)"
+				 " VALUES (?, ?, ?)"
+				 " ON CONFLICT (channel_id) DO UPDATE SET"
+				 "  commitnum = excluded.commitnum"
+				 ", batch = excluded.batch"));
+	db_bind_u64(stmt, dbid);
+	db_bind_u64(stmt, commitnum);
+	db_bind_blob(stmt, batch, batch_len);
+	db_exec_prepared_v2(take(stmt));
+}
+
+const u8 *wallet_sent_commitsig_get(const tal_t *ctx, struct wallet *w,
+				    u64 dbid, u64 *commitnum)
+{
+	struct db_stmt *stmt;
+	const u8 *batch;
+
+	stmt = db_prepare_v2(w->db,
+			     SQL("SELECT commitnum, batch FROM sent_commitsigs"
+				 " WHERE channel_id = ?"));
+	db_bind_u64(stmt, dbid);
+	db_query_prepared(stmt);
+
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return NULL;
+	}
+	*commitnum = db_col_u64(stmt, "commitnum");
+	batch = tal_dup_arr(ctx, u8, (const u8 *)db_col_blob(stmt, "batch"),
+			    db_col_bytes(stmt, "batch"), 0);
+	tal_free(stmt);
+	return batch;
+}
+
 static struct short_channel_id *db_col_optional_scid(const tal_t *ctx,
 						     struct db_stmt *stmt,
 						     const char *colname)

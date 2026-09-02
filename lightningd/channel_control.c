@@ -507,6 +507,56 @@ static void handle_splice_lookup_tx(struct lightningd *ld,
 	subd_send_msg(channel->owner, take(outmsg));
 }
 
+/* fork #125: durably store the exact commitment_signed bytes channeld is
+ * about to write, so a crash-resume can replay them (never re-sign). */
+static void handle_store_sent_commitsig(struct lightningd *ld,
+					struct channel *channel,
+					const u8 *msg)
+{
+	u64 commitnum;
+	u8 *batch;
+
+	if (!fromwire_channeld_store_sent_commitsig(tmpctx, msg, &commitnum,
+						    &batch)) {
+		channel_internal_error(channel,
+				       "bad store_sent_commitsig: %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+	wallet_sent_commitsig_save(ld->wallet, channel->dbid,
+				   commitnum, batch, tal_bytelen(batch));
+	subd_send_msg(channel->owner,
+		      take(towire_channeld_store_sent_commitsig_reply(NULL)));
+}
+
+static void handle_fetch_sent_commitsig(struct lightningd *ld,
+					struct channel *channel,
+					const u8 *msg)
+{
+	u64 commitnum, stored_commitnum = 0;
+	const u8 *batch;
+	u8 *outmsg;
+
+	if (!fromwire_channeld_fetch_sent_commitsig(msg, &commitnum)) {
+		channel_internal_error(channel,
+				       "bad fetch_sent_commitsig: %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	batch = wallet_sent_commitsig_get(tmpctx, ld->wallet, channel->dbid,
+					  &stored_commitnum);
+	/* Absent or stale (a different commitment number): report empty. */
+	if (batch && stored_commitnum != commitnum)
+		batch = NULL;
+
+	if (!batch)
+		batch = tal_arr(tmpctx, u8, 0);
+	outmsg = towire_channeld_fetch_sent_commitsig_result(NULL, commitnum,
+							     batch);
+	subd_send_msg(channel->owner, take(outmsg));
+}
+
 /* Extra splice data we want to store for bitcoin send tx interface */
 struct send_splice_info
 {
@@ -1649,6 +1699,12 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNELD_SPLICE_LOOKUP_TX:
 		handle_splice_lookup_tx(sd->ld, sd->channel, msg);
 		break;
+	case WIRE_CHANNELD_STORE_SENT_COMMITSIG:
+		handle_store_sent_commitsig(sd->ld, sd->channel, msg);
+		break;
+	case WIRE_CHANNELD_FETCH_SENT_COMMITSIG:
+		handle_fetch_sent_commitsig(sd->ld, sd->channel, msg);
+		break;
 	case WIRE_CHANNELD_SPLICE_CONFIRMED_SIGNED:
 		handle_splice_confirmed_signed(sd->ld, sd->channel, msg);
 		break;
@@ -1688,6 +1744,8 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNELD_GOT_INFLIGHT:
 	case WIRE_CHANNELD_DEV_PEER_SHACHAIN:
 		/* Replies go to requests. */
+	case WIRE_CHANNELD_STORE_SENT_COMMITSIG_REPLY:
+	case WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT:
 	case WIRE_CHANNELD_OFFER_HTLC_REPLY:
 	case WIRE_CHANNELD_DEV_REENABLE_COMMIT_REPLY:
 	case WIRE_CHANNELD_DEV_MEMLEAK_REPLY:
