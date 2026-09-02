@@ -1151,6 +1151,13 @@ static struct command_result *json_invoice(struct command *cmd,
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "dev-routes requires --developer");
 
+	/* push_varlen_field() can only encode up to 60 bits: refuse
+	 * instead of aborting the daemon in bolt11_encode(). */
+	if (*expiry >= (u64)1 << 60)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "expiry must be below 2^60 to be encodable"
+				    " in a bolt11");
+
 	if (strlen(info->label->s) > inv_max_label_len) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Label '%s' over %zu bytes", info->label->s, inv_max_label_len);
