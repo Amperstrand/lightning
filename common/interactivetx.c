@@ -112,6 +112,22 @@ static u8 *read_next_msg(const tal_t *ctx,
 		if (is_unknown_msg_discardable(msg))
 			continue;
 
+		/* fork #124 (inr2-splice-harness): a belated announcement_signatures
+		 * for a prior funding can land mid-negotiation (the depth watch
+		 * fires while the next round's tx negotiation is active) — the
+		 * STFU-phase dispatcher already tolerates exactly this ("or a
+		 * belated announcement_signatures!", channeld.c); extend the same
+		 * tolerance here. Dropped with a log: the announcement is
+		 * re-requestable via the channel_reestablish retransmit_flags bit
+		 * once that is honored. Failing the peer here races a healthy
+		 * gossip exchange against a healthy splice. */
+		if (fromwire_peektype(msg) == WIRE_ANNOUNCEMENT_SIGNATURES) {
+			status_debug("interactivetx: ignoring belated"
+				     " announcement_signatures during"
+				     " negotiation");
+			continue;
+		}
+
 		/* A helper which decodes an error. */
 		desc = is_peer_error(msg, msg);
 		if (desc) {

@@ -1437,8 +1437,12 @@ static bool maybe_replay_commitments(struct peer *peer, u64 commitnum)
 	if (!fromwire_channeld_fetch_sent_commitsig_result(tmpctx, reply,
 							   &num, &blob))
 		master_badmsg(WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT, reply);
-	if (num != commitnum || !blob || tal_bytelen(blob) == 0)
+	if (num != commitnum || !blob || tal_bytelen(blob) == 0) {
+		status_debug("Splice resume: no stored batch for num %"PRIu64
+			     " (fetched num %"PRIu64", blob %zu)",
+			     commitnum, num, blob ? tal_bytelen(blob) : 0);
 		return false;
+	}
 	stored = unframe_msg_batch(tmpctx, blob, tal_bytelen(blob));
 	if (!stored || tal_count(stored) == 0)
 		return false;
