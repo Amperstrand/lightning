@@ -1418,8 +1418,14 @@ static void store_sent_commitsigs(struct peer *peer,
 {
 	u8 *blob = frame_msg_batch(tmpctx, msgs, num_msgs);
 	u8 *msg = towire_channeld_store_sent_commitsig(NULL, commitnum, blob);
+	/* #125 latency probe: the persist-then-send round-trip cost */
+	double t0 = time_now().ts.tv_sec + time_now().ts.tv_nsec / 1e9;
 	master_wait_sync_reply(tmpctx, peer, take(msg),
 			       WIRE_CHANNELD_STORE_SENT_COMMITSIG_REPLY);
+	status_debug("store_sent_commitsigs: %zu usec (num %"PRIu64
+		     ", %zu msgs)",
+		     (size_t)((time_now().ts.tv_sec + time_now().ts.tv_nsec / 1e9 - t0) * 1000000),
+		     commitnum, num_msgs);
 }
 
 /* fork #125 resume: REPLAY the durably stored commitment_signed batch
