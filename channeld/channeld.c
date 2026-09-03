@@ -3179,6 +3179,20 @@ static const u8 *peer_expect_msg_four(const tal_t *ctx,
 
 	msg = peer_read(ctx, peer->pps);
 	type = fromwire_peektype(msg);
+	/* fork #124 (inr2-splice-harness): a belated
+	 * announcement_signatures for a prior funding can land in the
+	 * commitment-exchange window too — process it inline (the same
+	 * handler peer_in dispatches to; the STFU gate already exempts
+	 * this type) and read again. Failing the peer here is the #124
+	 * race: a healthy gossip exchange colliding with a healthy
+	 * splice. */
+	while (type == WIRE_ANNOUNCEMENT_SIGNATURES) {
+		status_debug("Splice: processing belated"
+			     " announcement_signatures mid-commitment-wait");
+		handle_peer_announcement_signatures(peer, msg);
+		msg = peer_read(ctx, peer->pps);
+		type = fromwire_peektype(msg);
+	}
 	if (type != expect_type
 	    && type != second_allowed_type
 	    && type != third_allowed_type
@@ -3200,6 +3214,23 @@ static const u8 *peer_expect_msg_four(const tal_t *ctx,
  * before resuming splice negotiation, so we need a way to process it in this
  * order. */
 static void peer_in(struct peer *peer, const u8 *msg);
+
+/* fork #124 (inr2-splice-harness): re-inject any
+ * announcement_signatures parked by common/interactivetx.c's
+ * read_next_msg — the gossip handshake must not be starved by a
+ * healthy splice. peer_in dispatches it through the normal handler
+ * (the STFU gate already exempts announcement_signatures). */
+static void reinject_parked_announce(struct peer *peer,
+				     struct interactivetx_context *ictx)
+{
+	if (!ictx->deferred_announce_sigs)
+		return;
+	status_debug("Splice: re-injecting parked"
+		     " announcement_signatures after negotiation");
+	peer_in(peer, ictx->deferred_announce_sigs);
+	ictx->deferred_announce_sigs
+		= tal_free(ictx->deferred_announce_sigs);
+}
 
 /* The question of "who signs splice commitments first" is the same order as the
  * splice `tx_signature`s are. This function handles sending & receiving the
@@ -4095,6 +4126,17 @@ static void resume_splice_negotiation(struct peer *peer,
 		else {
 			status_debug("Splice: Awaiting signature message");
 			msg = peer_read(tmpctx, peer->pps);
+			/* fork #124: the belated announcement_signatures
+			 * race reaches this reader too — process inline
+			 * and read again, same as peer_expect_msg_four. */
+			while (fromwire_peektype(msg)
+			       == WIRE_ANNOUNCEMENT_SIGNATURES) {
+				status_debug("Splice: processing belated"
+					     " announcement_signatures"
+					     " mid-signature-wait");
+				handle_peer_announcement_signatures(peer, msg);
+				msg = peer_read(tmpctx, peer->pps);
+			}
 			/* fork #130: a premature-but-allowed message (e.g. the
 			 * reestablish-time channel_ready retransmit, which
 			 * fires while both commit numbers are still 1) must
@@ -4480,6 +4522,7 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 	error = process_interactivetx_updates(tmpctx, ictx,
 					      &peer->splicing->received_tx_complete,
 					      &abort_msg);
+	reinject_parked_announce(peer, ictx);
 	if (error)
 		peer_failed_err(peer->pps, &peer->channel_id,
 				"Interactive splicing error: %s", error);
@@ -4737,6 +4780,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	error = process_interactivetx_updates(tmpctx, ictx,
 					      &peer->splicing->received_tx_complete,
 					      &abort_msg);
+	reinject_parked_announce(peer, ictx);
 	if (error)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Splice interactivetx error: %s", error);
@@ -4947,6 +4991,7 @@ static void splice_initiator_user_update(struct peer *peer, const u8 *inmsg)
 	error = process_interactivetx_updates(tmpctx, ictx,
 					      &peer->splicing->received_tx_complete,
 					      &abort_msg);
+	reinject_parked_announce(peer, ictx);
 	if (error)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				"Splice update error: %s", error);

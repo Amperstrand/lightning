@@ -65,6 +65,7 @@ struct interactivetx_context *new_interactivetx_context(const tal_t *ctx,
 	ictx->current_psbt = create_psbt(ictx, 0, 0, 0);
 	ictx->desired_psbt = NULL;
 	ictx->pause_when_complete = false;
+	ictx->deferred_announce_sigs = NULL;
 	ictx->change_set = NULL;
 
 	return ictx;
@@ -131,6 +132,32 @@ static u8 *read_next_msg(const tal_t *ctx,
 		 * it's possible we can get some different messages in
 		 * the meantime! */
 		t = fromwire_peektype(msg);
+
+		/* fork #124 (inr2-splice-harness): a belated
+		 * announcement_signatures for a prior funding can land
+		 * mid-negotiation (the depth watch fires while the next
+		 * round's negotiation is active). Park the FIRST one on the
+		 * ictx for the splice user to re-inject at its negotiation
+		 * exits — round 1 of this fix DROPPED it and starved
+		 * announce-dependent flows; failing the peer races a healthy
+		 * gossip exchange against a healthy splice. Duplicates are
+		 * logged and dropped (the parked copy covers delivery). */
+		if (t == WIRE_ANNOUNCEMENT_SIGNATURES) {
+			if (!state->deferred_announce_sigs) {
+				state->deferred_announce_sigs
+					= tal_steal(state, msg);
+				status_debug("interactivetx: parking belated"
+					     " announcement_signatures for"
+					     " re-injection");
+			} else {
+				status_debug("interactivetx: dropping duplicate"
+					     " belated"
+					     " announcement_signatures");
+			}
+			msg = NULL;
+			continue;
+		}
+
 		switch (t) {
 		case WIRE_TX_ADD_INPUT:
 		case WIRE_TX_REMOVE_INPUT:

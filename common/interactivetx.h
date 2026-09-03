@@ -62,6 +62,17 @@ struct interactivetx_context {
 	 */
 	bool pause_when_complete;
 
+	/* fork #124 (inr2-splice-harness): a belated
+	 * announcement_signatures arriving mid-negotiation (the prior
+	 * funding's depth watch fires while this negotiation is active) is
+	 * parked here — NOT dropped (round 1 of this fix starved
+	 * announce-dependent flows) and NOT fatal (races a healthy gossip
+	 * exchange against a healthy splice). The splice user re-injects
+	 * it via its dispatcher at the negotiation exits; unused by the
+	 * dual-fund path (announcement_signatures cannot precede
+	 * channel_ready). */
+	const u8 *deferred_announce_sigs;
+
 	/* Internal cached change set */
 	struct psbt_changeset *change_set;
 };
