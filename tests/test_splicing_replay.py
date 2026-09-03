@@ -150,10 +150,6 @@ def test_replay_peer_already_received(node_factory, bitcoind, executor):
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'regtest-only')
-@pytest.mark.xfail(reason="#130: multi-round crash-resume neither reaches a "
-                          "REPLAYING branch nor converges post-crash (the "
-                          "re-sign fallback deadlocks); XPASS when #130 "
-                          "closes")
 def test_replay_multiround_crash(node_factory, bitcoind, executor):
     """Rapid sequential rounds; round 2's commitment send aborts. The
     resume replays at an ADVANCED number with confirmed-round history."""
@@ -189,6 +185,13 @@ def test_replay_multiround_crash(node_factory, bitcoind, executor):
     l1.daemon.wait_for_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL',
                            timeout=60)
 
+    # Let round-0's announcement exchange settle BEFORE round 1's STFU:
+    # a mid-negotiation WIRE_ANNOUNCEMENT_SIGNATURES is the #124 race
+    # (load-biased, both arms). This test is the #130 repro, not the
+    # #124 vehicle — decouple them.
+    l1.daemon.wait_for_log(r'peer_in WIRE_ANNOUNCEMENT_SIGNATURES', 60)
+    l2.daemon.wait_for_log(r'peer_in WIRE_ANNOUNCEMENT_SIGNATURES', 60)
+
     # Round 1 (splice IN — the proven alternating shape; a second OUT
     # round trips CLN's funding accounting): the abort fires mid-round.
     funds_result = l1.rpc.fundpsbt("111722sat", 0, 0, excess_as_change=True)
@@ -203,15 +206,26 @@ def test_replay_multiround_crash(node_factory, bitcoind, executor):
     del l1.daemon.opts['dev-disconnect']
     l1.start()
 
+    # fork #130 contract: with user sigs still pending (the crash ate the
+    # signpsbt step), the resume PARKS at the signature phase — but the
+    # commitment exchange completes, l1 REPLAYING its stored round-1
+    # batch (never re-signing; the pre-fix code dropped the next_funding
+    # TLV and mis-aborted the peer's valid resume as "not recognized").
+    # The order is chronological: pyln wait_for_log only matches forward
+    # from a cursor, and on l1 the park line (reestablish prep) precedes
+    # the reestablish exchange, which precedes the replay.
+    l1.daemon.wait_for_log(r'park at the signature phase', 30)
     l1.daemon.wait_for_log(r'peer_in WIRE_CHANNEL_REESTABLISH')
     l2.daemon.wait_for_log(r'peer_in WIRE_CHANNEL_REESTABLISH')
+    l1.daemon.wait_for_log(r'Splice resume: replaying [0-9]+ stored '
+                           r'commitment_signed msgs', 30)
 
-    # UNDER INVESTIGATION (#126): in the multi-round shape, neither the
-    # natural channeld auto-restart nor the post-kill restart reaches a
-    # REPLAYING resume — l1's reestablish takes the no-next_funding-TLV
-    # branch and re-signs (permissive-tolerated; strict would refuse).
-    # The behavioral contract still holds and is asserted below; the
-    # replay-line assert returns when #126 closes.
+    # The interrupted user step, completed post-restart: sign our wallet
+    # input and submit — this un-parks the negotiation and the splice
+    # completes (the real-world journey for a crash mid-signing).
+    signed = l1.rpc.signpsbt(result['psbt'])['signed_psbt']
+    l1.rpc.splice_signed(chan_id, signed)
+
     _mine_and_converge(bitcoind, l1, l2)
 
     inv = l2.rpc.invoice(10**2, 'rp3', 'replay3')

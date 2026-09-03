@@ -4095,6 +4095,16 @@ static void resume_splice_negotiation(struct peer *peer,
 		else {
 			status_debug("Splice: Awaiting signature message");
 			msg = peer_read(tmpctx, peer->pps);
+			/* fork #130: a premature-but-allowed message (e.g. the
+			 * reestablish-time channel_ready retransmit, which
+			 * fires while both commit numbers are still 1) must
+			 * not kill the resume — process it and read again,
+			 * exactly like the commitment-phase read above. */
+			if (allowed_premature_msg
+			    && fromwire_peektype(msg) == allowed_premature_msg) {
+				peer_in(peer, msg);
+				msg = peer_read(tmpctx, peer->pps);
+			}
 			status_debug("Splice: Got peer message! (is signature?)");
 		}
 
@@ -5063,7 +5073,16 @@ static void splice_initiator_user_signed(struct peer *peer, const u8 *inmsg)
 	audit_psbt(inflight->psbt, inflight->psbt);
 	assert(tal_parent(inflight->psbt) != tmpctx);
 
-	resume_splice_negotiation(peer, false, false, true, sign_first, false, 0);
+	/* fork #130: if the peer signed early (while we were parked waiting
+	 * for the user's splice_signed), their tx_signatures sit cached in
+	 * splicing->tx_sig_msg — we must process them even when we sign
+	 * second, or the funding 2of2 witness never gets assembled and the
+	 * broadcast fails with an empty witness. */
+	resume_splice_negotiation(peer, false, false, true,
+				  sign_first
+				  || (peer->splicing
+				      && peer->splicing->tx_sig_msg),
+				  false, 0);
 
 	audit_psbt(inflight->psbt, inflight->psbt);
 	assert(tal_parent(inflight->psbt) != tmpctx);
@@ -5260,6 +5279,17 @@ static void peer_in(struct peer *peer, const u8 *msg)
 			peer->splicing->tx_sig_msg = tal_steal(peer->splicing,
 							       msg);
 			return;
+		} else if (type == WIRE_CHANNEL_READY
+			   && peer->channel_ready[REMOTE]) {
+			/* fork #130: the reestablish-time channel_ready
+			 * retransmit (fires while both commit numbers are
+			 * still 1) can land while we sit parked in STFU
+			 * awaiting the user's splice_signed. Redundant by
+			 * BOLT #2 ("MUST ignore any redundant
+			 * channel_ready") — same class as the belated
+			 * announcement_signatures below. */
+			status_debug("Ignoring redundant channel_ready"
+				     " while quiescent");
 		} else if (type != WIRE_ANNOUNCEMENT_SIGNATURES) {
 			peer_failed_warn(peer->pps, &peer->channel_id,
 					 "Received message %s when only TX_ABORT was"
@@ -5801,6 +5831,7 @@ static void peer_reconnect(struct peer *peer,
 	u64 send_next_commitment_number;
 
 	struct tlv_channel_reestablish_tlvs *send_tlvs, *recv_tlvs;
+	bool resume_park_user_sigs;
 
 	dataloss_protect = feature_negotiated(peer->our_features,
 					      peer->their_features,
@@ -5820,40 +5851,53 @@ static void peer_reconnect(struct peer *peer,
 	inflight = last_inflight(peer);
 
 	send_next_commitment_number = peer->next_index[LOCAL];
+	resume_park_user_sigs = false;
 	if (inflight && (!inflight->last_tx || !inflight->remote_tx_sigs)) {
 		if (missing_user_signatures(peer,
 					    inflight->i_am_initiator
 					        ? TX_INITIATOR
 					        : TX_ACCEPTER,
 					    inflight->psbt)) {
-			status_info("Unable to resume splice as user sig(s)"
-				    " are missing.");
-			inflight = NULL;
+			/* fork #130: upstream (5818b522f) nulls the inflight
+			 * here, which drops our next_funding TLV and then
+			 * mis-aborts the peer's valid resume as
+			 * "next_funding_txid not recognized". But user
+			 * signatures only gate the *signature* phase — the
+			 * commitment exchange (incl. the #125 replay of our
+			 * stored batch) is fully resumable. Park instead:
+			 * still send the TLV, resume commitments only, and
+			 * wait for `splice_signed` from the user. */
+			status_info("Resuming splice with user sig(s) still"
+				    " missing: negotiation will park at the"
+				    " signature phase until splice_signed.");
+			resume_park_user_sigs = true;
 		} else {
 			status_info("Reconnecting to peer with pending inflight"
 				    " commit: %s, remote sigs: %s.",
 				    inflight->last_tx ? "received" : "missing",
 				    inflight->remote_tx_sigs ? "received" : "missing");
-
-			if (!send_tlvs) {
-				/* Subtle: we free tmpctx below as we loop, so
-				 * tal off peer */
-				send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
-			}
-			send_tlvs->next_funding = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
-			send_tlvs->next_funding->next_funding_txid = inflight->outpoint.txid;
-
-			/* BOLT-??? #2:
-			 * The `next_funding.retransmit_flags` bitfield is used to let the
-			 * receiving peer know which messages they must retransmit for the
-			 * corresponding `next_funding_txid` after the reconnection:
-			 * | Bit Position  | Name                |
-			 * | ------------- | --------------------|
-			 * | 0             | `commitment_signed` |
-			 */
-			if (!inflight->last_tx)
-				send_tlvs->next_funding->retransmit_flags |= 1; /* commitment_signed */
 		}
+
+		/* fork #130: the TLV goes out either way — the peer needs
+		 * to know we still hold this inflight. */
+		if (!send_tlvs) {
+			/* Subtle: we free tmpctx below as we loop, so
+			 * tal off peer */
+			send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
+		}
+		send_tlvs->next_funding = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
+		send_tlvs->next_funding->next_funding_txid = inflight->outpoint.txid;
+
+		/* BOLT-??? #2:
+		 * The `next_funding.retransmit_flags` bitfield is used to let the
+		 * receiving peer know which messages they must retransmit for the
+		 * corresponding `next_funding_txid` after the reconnection:
+		 * | Bit Position  | Name                |
+		 * | ------------- | --------------------|
+		 * | 0             | `commitment_signed` |
+		 */
+		if (!inflight->last_tx)
+			send_tlvs->next_funding->retransmit_flags |= 1; /* commitment_signed */
 	}
 
 	/* BOLT-??? #2:
@@ -6036,6 +6080,19 @@ static void peer_reconnect(struct peer *peer,
 		    remote_next_funding ? "received" : "empty",
 		    tal_count(peer->splice_state->inflights));
 
+	/* fork #130: when parking for user sigs, reconstruct the splice
+	 * context so the later `splice_signed` (the interrupted user step)
+	 * passes the mode/tx_complete gates: commitments secured implies
+	 * the tx negotiation completed on both sides pre-crash. */
+	if (resume_park_user_sigs && inflight) {
+		if (!peer->splicing)
+			peer->splicing = splicing_new(peer);
+		peer->splicing->mode = true;
+		peer->splicing->received_tx_complete = true;
+		peer->splicing->sent_tx_complete = true;
+		peer->splicing->current_psbt = inflight->psbt;
+	}
+
 	/* DTODO: Update splice BOLT spec PR and reference here. */
 	if (inflight && (remote_next_funding || local_next_funding)) {
 		if (!remote_next_funding) {
@@ -6044,7 +6101,12 @@ static void peer_reconnect(struct peer *peer,
 						  false,
 						  !inflight->last_tx,
 						  false,
-						  true,
+						  /* fork #130: parked resumes
+						   * must not block the main
+						   * loop on peer sigs — the
+						   * user's splice_signed
+						   * still has to arrive. */
+						  !resume_park_user_sigs,
 						  true,
 						  WIRE_CHANNEL_READY);
 		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
@@ -6061,8 +6123,14 @@ static void peer_reconnect(struct peer *peer,
 						  	? remote_next_funding->retransmit_flags & 1
 						  	: false,
 						  local_next_funding && !inflight->last_tx,
-						  true,
-						  local_next_funding,
+						  /* fork #130: park at the
+						   * commitment phase when user
+						   * sigs are pending; the
+						   * signature phase resumes
+						   * from splice_signed. */
+						  !resume_park_user_sigs,
+						  local_next_funding
+						  	&& !resume_park_user_sigs,
 						  true,
 						  WIRE_CHANNEL_READY);
 		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
