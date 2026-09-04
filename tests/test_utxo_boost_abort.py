@@ -55,7 +55,8 @@ HTLC_MSAT = 10**8
 U32_MAX = 2**32 - 1
 
 
-def _node_with_single_utxo(node_factory, bitcoind, deposit_sat, opts):
+def _node_with_single_utxo(node_factory, bitcoind, deposit_sat, opts,
+                           feerates=(15000, 11000, 7500, 3750)):
     """Return (l1, l2) where l1's wallet holds EXACTLY ONE confirmed
     spendable UTXO worth ~deposit_sat, with a confirmed channel to l2.
 
@@ -67,7 +68,7 @@ def _node_with_single_utxo(node_factory, bitcoind, deposit_sat, opts):
     With a single deposit UTXO the loop provably examines it: initial
     feerate is 0 and feerate_target >= FEERATE_FLOOR (253).
     """
-    l1 = node_factory.get_node(options=opts)
+    l1 = node_factory.get_node(options=opts, feerates=feerates)
     l2 = node_factory.get_node()
 
     addr = l1.rpc.newaddr('bech32')['bech32']
@@ -132,8 +133,8 @@ def test_utxo_boost_abort_fat_utxo_fails_loudly(node_factory, bitcoind,
     l1, l2 = _node_with_single_utxo(
         node_factory, bitcoind, FAT_DEPOSIT_SAT,
         opts={'may_fail': True,
-              'broken_log': r'FATAL SIGNAL|backtrace|crash',
-              'feerates': (15000, 11000, 7500, 3750)})
+              'broken_log': r'FATAL SIGNAL|backtrace|crash'},
+        feerates=(15000, 11000, 7500, 3750))
     _force_close_with_stuck_htlc(l1, l2, bitcoind, executor)
 
     # The abort site: FATAL SIGNAL 6 (SIGABRT), printed by the crash
@@ -161,7 +162,8 @@ def test_utxo_boost_below_boundary_survives(node_factory, bitcoind,
     """
     l1, l2 = _node_with_single_utxo(
         node_factory, bitcoind, BELOW_DEPOSIT_SAT,
-        opts={'feerates': (15000, 11000, 7500, 3750)})
+        opts={},
+        feerates=(15000, 11000, 7500, 3750))
     _force_close_with_stuck_htlc(l1, l2, bitcoind, executor)
 
     # wallet_utxo_boost ran and logged (either "got N UTXOs" early
@@ -183,7 +185,8 @@ def test_utxo_boost_control_normal_wallet_survives(node_factory, bitcoind,
     """
     l1, l2 = _node_with_single_utxo(
         node_factory, bitcoind, CONTROL_DEPOSIT_SAT,
-        opts={'feerates': (15000, 11000, 7500, 3750)})
+        opts={},
+        feerates=(15000, 11000, 7500, 3750))
     _force_close_with_stuck_htlc(l1, l2, bitcoind, executor)
 
     l1.daemon.wait_for_log('wallet_utxo_boost:')
