@@ -55,7 +55,8 @@ HTLC_MSAT = 10**8
 U32_MAX = 2**32 - 1
 
 
-def _node_with_single_utxo(node_factory, bitcoind, deposit_sat, opts,
+def _node_with_single_utxo(node_factory, bitcoind, deposit_sat,
+                           may_fail=False, broken_log=None, opts=None,
                            feerates=(15000, 11000, 7500, 3750)):
     """Return (l1, l2) where l1's wallet holds EXACTLY ONE confirmed
     spendable UTXO worth ~deposit_sat, with a confirmed channel to l2.
@@ -67,8 +68,15 @@ def _node_with_single_utxo(node_factory, bitcoind, deposit_sat, opts,
     before the fat UTXO is ever examined - a coin-flip, not a verdict.
     With a single deposit UTXO the loop provably examines it: initial
     feerate is 0 and feerate_target >= FEERATE_FLOOR (253).
+
+    may_fail/broken_log are get_node kwargs (teardown expectations), NOT
+    lightningd options: get_node(options=...) passes the dict verbatim
+    as CLI flags, so pyln-internal keys here would die as
+    "--may_fail=True: unknown option".
     """
-    l1 = node_factory.get_node(options=opts, feerates=feerates)
+    l1 = node_factory.get_node(options=opts if opts else {},
+                               feerates=feerates,
+                               may_fail=may_fail, broken_log=broken_log)
     l2 = node_factory.get_node()
 
     addr = l1.rpc.newaddr('bech32')['bech32']
@@ -132,8 +140,7 @@ def test_utxo_boost_abort_fat_utxo_fails_loudly(node_factory, bitcoind,
     """
     l1, l2 = _node_with_single_utxo(
         node_factory, bitcoind, FAT_DEPOSIT_SAT,
-        opts={'may_fail': True,
-              'broken_log': r'FATAL SIGNAL|backtrace|crash'},
+        may_fail=True, broken_log=r'FATAL SIGNAL|backtrace|crash',
         feerates=(15000, 11000, 7500, 3750))
     _force_close_with_stuck_htlc(l1, l2, bitcoind, executor)
 
@@ -162,7 +169,6 @@ def test_utxo_boost_below_boundary_survives(node_factory, bitcoind,
     """
     l1, l2 = _node_with_single_utxo(
         node_factory, bitcoind, BELOW_DEPOSIT_SAT,
-        opts={},
         feerates=(15000, 11000, 7500, 3750))
     _force_close_with_stuck_htlc(l1, l2, bitcoind, executor)
 
@@ -185,7 +191,6 @@ def test_utxo_boost_control_normal_wallet_survives(node_factory, bitcoind,
     """
     l1, l2 = _node_with_single_utxo(
         node_factory, bitcoind, CONTROL_DEPOSIT_SAT,
-        opts={},
         feerates=(15000, 11000, 7500, 3750))
     _force_close_with_stuck_htlc(l1, l2, bitcoind, executor)
 
