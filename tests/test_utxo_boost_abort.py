@@ -141,8 +141,23 @@ def _force_close_with_stuck_htlc(l1, l2, bitcoind, executor):
     bitcoind.generate_block(1)
     # Only a live daemon can log the ONCHAIN transition; on a vulnerable
     # build the abort (the finding) killed l1 at the close broadcast and
-    # the test body's FATAL wait is the verdict.
-    if l1.daemon.proc.poll() is None:
+    # the test body's FATAL wait is the verdict.  Bounded death wait,
+    # NOT a bare instantaneous poll() gate: campaign A's loop arm
+    # (banked: vm-pull-loop) proved poll() can still return None on a
+    # crashed daemon while the crashdump teardown (backtrace print,
+    # crash.log dump, kill(getpid()), kernel reap) is still running -
+    # the old gate then waited the full TIMEOUT on ' to ONCHAIN', a
+    # line the dead daemon could never log.  The 60s bound absorbs slow
+    # crashdump/symbolizer exits (degraded-backtrace hang suspicion);
+    # a daemon that neither dies nor logs the transition within it is a
+    # real anomaly -> loud ValueError.
+    try:
+        wait_for(lambda: l1.daemon.proc.poll() is not None, timeout=60)
+    except ValueError:
+        # Still alive: healthy builds fall through to the chain
+        # observable here after the 60s bound (acceptable under
+        # TIMEOUT=180); vulnerable builds never reach this branch -
+        # they proceed at death to the body's FATAL rail.
         l1.daemon.wait_for_log(' to ONCHAIN')
 
 
