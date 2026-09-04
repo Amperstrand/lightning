@@ -128,8 +128,22 @@ def _force_close_with_stuck_htlc(l1, l2, bitcoind, executor):
         l1.rpc.dev_fail(l2.info['id'])
     except OSError:
         pass
+    # Proven sibling sequence (test_onchain_different_fees): sync the
+    # unilateral close tx into the mempool BEFORE mining.  A bare
+    # generate_block(1) races the close broadcast - the mined block
+    # misses the tx, the channel never leaves AWAITING_UNILATERAL and
+    # ' to ONCHAIN' never appears (run4 evidence: the commitment tx was
+    # re-broadcast AFTER the generated block was added).
+    try:
+        l1.wait_for_channel_onchain(l2.info['id'])
+    except OSError:
+        pass
     bitcoind.generate_block(1)
-    l1.daemon.wait_for_log(' to ONCHAIN')
+    # Only a live daemon can log the ONCHAIN transition; on a vulnerable
+    # build the abort (the finding) killed l1 at the close broadcast and
+    # the test body's FATAL wait is the verdict.
+    if l1.daemon.proc.poll() is None:
+        l1.daemon.wait_for_log(' to ONCHAIN')
 
 
 def test_utxo_boost_abort_fat_utxo_fails_loudly(node_factory, bitcoind,
