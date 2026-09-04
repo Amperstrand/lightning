@@ -571,18 +571,23 @@ struct utxo *wallet_utxo_get(const tal_t *ctx, struct wallet *w,
 	return utxo;
 }
 
-static u32 calc_feerate(struct amount_sat excess_sats,
-			struct amount_sat output_sats_required,
-			size_t weight)
+static bool calc_feerate(u32 *feerate,
+			 struct amount_sat excess_sats,
+			 struct amount_sat output_sats_required,
+			 size_t weight)
 {
 	struct amount_sat fee;
-	u32 feerate;
 
-	if (!amount_sat_sub(&fee, excess_sats, output_sats_required))
-		return 0;
-	if (!amount_feerate(&feerate, fee, weight))
-		abort();
-	return feerate;
+	/* Can't even afford the output: the UTXO still helps, at feerate 0 */
+	if (!amount_sat_sub(&fee, excess_sats, output_sats_required)) {
+		*feerate = 0;
+		return true;
+	}
+	/* A feerate above u32-max sat/kw is unrepresentable: the caller
+	 * must skip this candidate, never abort. */
+	if (!amount_feerate(feerate, fee, weight))
+		return false;
+	return true;
 }
 
 /* Gather enough utxos to meet feerate, otherwise all we can. */
@@ -602,7 +607,9 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 	/* Select in random order */
 	tal_arr_randomize(all_utxos, struct utxo *);
 
-	feerate = calc_feerate(excess_sats, output_sats_required, *weight);
+	/* Unrepresentable initial feerate just means we need UTXOs */
+	if (!calc_feerate(&feerate, excess_sats, output_sats_required, *weight))
+		feerate = 0;
 
 	for (size_t i = 0; i < tal_count(all_utxos); i++) {
 		u32 new_feerate;
@@ -637,8 +644,10 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 			abort();
 
 		new_weight = *weight + utxo_spend_weight(utxo, 0);
-		new_feerate = calc_feerate(new_excess_sats, output_sats_required,
-					   new_weight);
+		/* Unrepresentable feerate: this UTXO cannot serve this boost */
+		if (!calc_feerate(&new_feerate, new_excess_sats,
+				  output_sats_required, new_weight))
+			continue;
 
 		/* Don't add uneconomic ones! */
 		if (new_feerate < feerate)

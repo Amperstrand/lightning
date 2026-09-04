@@ -323,8 +323,14 @@ static struct wally_psbt *try_anchor_psbt(const tal_t *ctx,
 	/* Add in base commitment fee to calculate *overall* package feerate */
 	if (!amount_sat_add(&fee, *fee_spent, anch->info.commitment_fee))
 		abort();
-	if (!amount_feerate(feerate, fee, *total_weight))
-		abort();
+	if (!amount_feerate(feerate, fee, *total_weight)) {
+		/* Feerate above u32-max sat/kw is unrepresentable: give up on
+		 * this anchor attempt rather than crash. */
+		log_unusual(channel->log,
+			    "Anchor PSBT feerate unrepresentable with selected inputs (fee %s, weight %zu): abandoning anchor attempt",
+			    fmt_amount_sat(tmpctx, fee), *total_weight);
+		return tal_free(psbt);
+	}
 
 	return psbt;
 }
@@ -397,6 +403,11 @@ static struct bitcoin_tx *spend_anchor(const tal_t *ctx,
 						 &fee,
 						 &feerate,
 						 &utxos);
+		if (!candidate_psbt) {
+			/* Feerate unrepresentable at this target won't improve
+			 * at higher ones: keep what we have (if anything). */
+			break;
+		}
 		log_debug(channel->log, "candidate_psbt total weight = %zu (commitment weight %u, anchor %zu)",
 			  weight, anch->info.commitment_weight, weight - anch->info.commitment_weight);
 
