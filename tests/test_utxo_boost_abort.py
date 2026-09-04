@@ -80,6 +80,11 @@ def _node_with_single_utxo(node_factory, bitcoind, deposit_sat,
     l2 = node_factory.get_node()
 
     addr = l1.rpc.newaddr('bech32')['bech32']
+    # The shared fixture wallet starts with almost no mature balance and
+    # regtest coinbases need 100 confs to spend: mine a batch so ~12
+    # coinbases (600 BTC) mature, covering the 300 BTC fat arm.
+    bitcoind.generate_block(112)
+    sync_blockheight(bitcoind, [l1, l2])
     bitcoind.send_and_mine_block(addr, deposit_sat)
     sync_blockheight(bitcoind, [l1, l2])
     wait_for(lambda: l1.rpc.listfunds()['outputs'] != [])
