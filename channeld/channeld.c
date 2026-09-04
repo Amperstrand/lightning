@@ -4107,6 +4107,33 @@ static void resume_splice_negotiation(struct peer *peer,
 		else {
 			status_debug("Splice: Awaiting signature message");
 			msg = peer_read(tmpctx, peer->pps);
+			/* fork #124/#130: the signature-wait must tolerate
+			 * EVERY belated-but-benign message in ANY order —
+			 * announcement_signatures (the #124 race) and the
+			 * reestablish-time channel_ready retransmit (both
+			 * commit numbers still 1). Two separate one-shot
+			 * blocks were not enough: a fast peer delivers
+			 * [channel_ready, announce] back-to-back and the
+			 * SECOND read fell through (VM A/B catch, 2026-09-04
+			 * — the loaded dev box never hit the ordering). One
+			 * unified loop, process-and-reread until a real
+			 * message arrives. */
+			for (;;) {
+				if (fromwire_peektype(msg)
+				    == WIRE_ANNOUNCEMENT_SIGNATURES) {
+					status_debug("Splice: processing belated"
+						     " announcement_signatures"
+						     " mid-signature-wait");
+					handle_peer_announcement_signatures(peer, msg);
+				} else if (allowed_premature_msg
+					   && fromwire_peektype(msg)
+					      == allowed_premature_msg) {
+					peer_in(peer, msg);
+				} else {
+					break;
+				}
+				msg = peer_read(tmpctx, peer->pps);
+			}
 			status_debug("Splice: Got peer message! (is signature?)");
 		}
 
