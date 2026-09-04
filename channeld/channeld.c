@@ -470,6 +470,9 @@ static void check_mutual_splice_locked(struct peer *peer)
 	status_debug("mutual splice_locked, scid LOCAL & REMOTE updated to: %s",
 		     fmt_short_channel_id(tmpctx,
 					  peer->splice_state->short_channel_id));
+	status_debug("SPLICE-NARRATE ev=mutual_splice_locked scid=%s",
+		     fmt_short_channel_id(tmpctx,
+					  peer->splice_state->short_channel_id));
 
 	inflight = NULL;
 	for (size_t i = 0; i < tal_count(peer->splice_state->inflights); i++)
