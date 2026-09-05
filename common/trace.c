@@ -411,6 +411,41 @@ void trace_span_end(const void *key)
 	trace_span_clear(s);
 }
 
+void trace_span_force_end(const void *key)
+{
+	struct span *s;
+	struct timeabs now;
+
+	if (disable_trace || !spans)
+		return;
+
+	s = trace_span_find(trace_key(key));
+	if (!s)
+		return;
+
+	if (s->suspended) {
+		s->suspended = false;
+		DTRACE_PROBE1(lightningd, span_resume, s->id);
+		if (trace_to_file) {
+			fprintf(trace_to_file, "span_resume %016" PRIx64 "\n",
+				s->id);
+			fflush(trace_to_file);
+		}
+	}
+	if (current == s)
+		current = s->parent;
+
+	now = time_now();
+	s->end_time = (now.ts.tv_sec * 1000000) + now.ts.tv_nsec / 1000;
+	DTRACE_PROBE1(lightningd, span_end, s->id);
+	if (trace_to_file) {
+		fprintf(trace_to_file, "span_end %016" PRIx64 "\n", s->id);
+		fflush(trace_to_file);
+	}
+	trace_emit(s);
+	trace_span_clear(s);
+}
+
 void trace_span_tag(const void *key, const char *name, const char *value)
 {
 	if (disable_trace)

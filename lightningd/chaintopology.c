@@ -1613,6 +1613,11 @@ void stop_topology(struct chain_topology *topo)
 	tal_free(topo->extend_timer);
 	tal_free(topo->updatefee_timer);
 
+	/* If we stop mid chain-sync, the extend_tip span is still open:
+	 * the async bitcoind call it was waiting on is orphaned when we
+	 * free request_ctx below, so nothing would ever end the span. */
+	trace_span_force_end(topo);
+
 	/* Don't handle responses to any existing requests. */
 	tal_free(topo->request_ctx);
 }
