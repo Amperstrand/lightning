@@ -5339,6 +5339,66 @@ def test_tracing(node_factory):
                     assert 'parentId' in res[0]
 
 
+@unittest.skipIf(env('HAVE_USDT') != '1', "Test requires tracing compiled in")
+def test_tracing_shutdown_mid_extend_tip(node_factory, bitcoind):
+    """A stop() right after startup can land inside the first extend_tip
+    span episode: the span must not leak past shutdown.
+
+    pyln's start() returns at the "Server started" log line, which
+    lightningd prints before begin_topology() starts the chain-sync poll.
+    Normally the first (no-op "no block at tip+1") fetch finishes in
+    milliseconds, before stop() arrives; under load it can stretch past
+    the harness's log-poll granularity, which is the CI flake.  We hold
+    the episode open deterministically by delaying every getblockhash
+    through the rpc proxy.
+    """
+    l1 = node_factory.get_node(start=False)
+
+    def delaying_getblockhash(r):
+        time.sleep(2)
+        return None
+
+    l1.daemon.rpcproxy.mock_rpc('getblockhash', delaying_getblockhash)
+    trace_fnamebase = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK,
+                                   "l1.trace")
+    l1.daemon.env["CLN_DEV_TRACE_FILE"] = trace_fnamebase
+    l1.start()
+    l1.stop()
+
+    traces = set()
+    suspended = set()
+    for fname in glob.glob(f"{trace_fnamebase}.*"):
+        with open(fname, "rt") as f:
+            for l in f:
+                parts = l.split(maxsplit=2)
+                cmd, spanid = parts[0], parts[1]
+                if cmd == 'span_emit':
+                    assert spanid in traces
+                    assert spanid not in suspended
+                    traces.remove(spanid)
+                elif cmd == 'span_end':
+                    assert spanid in traces
+                elif cmd == 'span_start':
+                    assert spanid not in traces
+                    traces.add(spanid)
+                elif cmd == 'span_suspend':
+                    assert spanid in traces
+                    assert spanid not in suspended
+                    suspended.add(spanid)
+                elif cmd == 'span_resume':
+                    assert spanid in traces
+                    suspended.remove(spanid)
+                elif cmd == 'destroying':
+                    pass
+                else:
+                    assert False, "Unknown trace line"
+
+    # One in-flight bitcoind call may be orphaned suspended at shutdown.
+    assert len(suspended) <= 1
+    assert suspended == traces, \
+        f"spans leaked at shutdown (open but not suspended): {traces - suspended}"
+
+
 def test_zero_locktime_blocks(node_factory, bitcoind):
     """Ensure our node "works" even if locktime set to 0."""
     l1, l2, l3 = node_factory.line_graph(3, opts=[{}, {'watchtime-blocks': 0}, {}], wait_for_announce=True)
