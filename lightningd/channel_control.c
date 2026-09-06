@@ -1986,6 +1986,38 @@ bool peer_start_channeld(struct channel *channel,
 		      take(towire_channeld_funding_depth(
 			   NULL, channel->scid, 0, false,
 			   &txid)));
+
+	/* Splice inflights that confirmed while the channel had no owner
+	 * (e.g. blocks processed during startup, before the peer reconnected
+	 * and channeld attached) never reach channeld: splice_depth_cb drops
+	 * the notification, and only a later block re-fires the watch. The
+	 * channel would sit in CHANNELD_AWAITING_SPLICE until then. Replay
+	 * the current depth so channeld can send splice_locked immediately. */
+	list_for_each(&channel->inflights, inflight, list) {
+		u32 tip_height, conf_height, depth;
+
+		/* Skip unconfirmed (scid unset / reorged out) or
+		 * already-locked inflights. */
+		if (!inflight->scid || inflight->locked_scid)
+			continue;
+
+		tip_height = get_block_height(ld->topology);
+		conf_height = short_channel_id_blocknum(*inflight->scid);
+		if (tip_height < conf_height)
+			continue;
+		depth = tip_height - conf_height + 1;
+
+		log_debug(channel->log,
+			  "replaying funding depth %u for splice inflight %s",
+			  depth,
+			  fmt_bitcoin_txid(tmpctx,
+					   &inflight->funding->outpoint.txid));
+
+		subd_send_msg(channel->owner,
+			      take(towire_channeld_funding_depth(
+					   NULL, inflight->scid, depth, true,
+					   &inflight->funding->outpoint.txid)));
+	}
 	return true;
 }
 
