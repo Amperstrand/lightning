@@ -366,7 +366,29 @@ void trace_span_start_(const char *name, const void *key)
 	if (disable_trace)
 		return;
 
-	assert(trace_span_find(numkey) == NULL);
+	/* A span with this key already exists: its owner object was freed
+	 * (tal address reuse) without the span being ended -- typically a
+	 * call suspended in flight whose callback never ran, e.g. a plugin
+	 * killed during shutdown.  Crash here used to take the whole node
+	 * down (CLN#9415); instead we end the stale span and carry on. */
+	struct span *stale = trace_span_find(numkey);
+	if (stale) {
+		fprintf(stderr, "trace: ending stale span %s (key=%zu) colliding with new %s\n",
+			stale->name, numkey, name);
+		fflush(stderr);
+		if (stale->suspended) {
+			stale->suspended = false;
+			if (trace_to_file) {
+				fprintf(trace_to_file, "span_resume %016" PRIx64 "\n",
+					stale->id);
+				fflush(trace_to_file);
+			}
+		}
+		if (current == stale)
+			current = stale->parent;
+		trace_emit(stale);
+		trace_span_clear(stale);
+	}
 	struct span *s = trace_span_slot();
 	if (!s)
 		return;
