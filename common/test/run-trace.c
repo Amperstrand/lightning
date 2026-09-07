@@ -1,5 +1,6 @@
 #include "config.h"
 #include <common/setup.h>
+#include <ccan/str/str.h>
 #include <common/trace.h>
 
 /* This is mostly a benchmark to see how much overhead the tracing
@@ -30,6 +31,18 @@ int main(int argx, char *argv[])
 		trace_span_end(&d);
 
 		trace_span_end(&a);
+	}
+	/* CLN#9415 mechanism, deterministic (campaign #163): a span
+	 * suspended and never resumed (the orphan class proven at
+	 * shutdown: a plugin call in flight when the plugin is killed)
+	 * keeps its key in the table; a NEW span started with the same
+	 * key (tal address reuse) is the duplicate-key collision. */
+	{
+		int x = 0;
+		trace_span_start("orphaned-call", &x);
+		trace_span_suspend(&x);
+		trace_span_start("jsonrpc-cmd", &x);
+		trace_span_end(&x);
 	}
 	trace_cleanup();
 	common_shutdown();
