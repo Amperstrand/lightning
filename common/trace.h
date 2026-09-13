@@ -16,9 +16,11 @@ void trace_span_remote(u64 trace_id_hi, u64 trade_id_lo, u64 span_id);
 #define TRACE_LBL __FILE__ ":" stringify(__LINE__)
 void trace_span_suspend_(const void *key, const char *lbl);
 void trace_span_suspend_may_free_(const void *key, const char *lbl);
+void trace_span_force_end_(const void *key, const char *lbl);
 void trace_span_resume_(const void *key, const char *lbl);
 #define trace_span_suspend(key) trace_span_suspend_(key, TRACE_LBL)
 #define trace_span_suspend_may_free(key) trace_span_suspend_may_free_(key, TRACE_LBL)
+#define trace_span_force_end(key) trace_span_force_end_(key, TRACE_LBL)
 #define trace_span_resume(key) trace_span_resume_(key, TRACE_LBL)
 
 #endif /* LIGHTNING_COMMON_TRACE_H */

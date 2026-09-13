@@ -458,20 +458,54 @@ void trace_span_suspend_(const void *key, const char *lbl)
 	}
 }
 
-static void destroy_trace_span(const void *key)
+void trace_span_force_end_(const void *key, const char *lbl)
 {
-	size_t numkey = trace_key(key);
-	struct span *span = trace_span_find(numkey);
+	struct timeabs now;
+	size_t numkey;
+	struct span *s;
 
-	/* It's usually ended normally. */
-	if (!span)
+	if (disable_trace)
 		return;
 
-	/* Otherwise resume so we can terminate it */
-	if (trace_to_file)
-		fprintf(trace_to_file, "destroying span\n");
-	trace_span_resume(key);
-	trace_span_end(key);
+	numkey = trace_key(key);
+	s = trace_span_find(numkey);
+
+	/* Usually ended (or force-ended) normally before this. */
+	if (!s)
+		return;
+
+	/* Teardown contexts can destroy the key while other spans are
+	 * current: emit and clear without disturbing the current chain
+	 * unless we are it. */
+	for (size_t i = 0; i < SPAN_MAX_TAGS; i++) {
+		if (!s->tags[i].name) {
+			s->tags[i].name = "force_end";
+			s->tags[i].valuestr = lbl;
+			s->tags[i].valuelen = strlen(lbl);
+			break;
+		}
+	}
+	now = time_now();
+	s->end_time = (now.ts.tv_sec * 1000000) + now.ts.tv_nsec / 1000;
+	DTRACE_PROBE1(lightningd, span_end, s->id);
+	if (trace_to_file) {
+		fprintf(trace_to_file, "span_force_end %016" PRIx64 "\n",
+			s->id);
+		fflush(trace_to_file);
+	}
+	trace_emit(s);
+	if (current == s)
+		current = s->parent;
+	trace_span_clear(s);
+}
+
+static void destroy_trace_span(const void *key)
+{
+	/* The old resume+end path asserted on the suspended/current
+	 * state and clobbered `current` when the destructor fired
+	 * nested inside other spans (shutdown teardown): force-end
+	 * instead. */
+	trace_span_force_end_(key, TRACE_LBL);
 }
 
 void trace_span_suspend_may_free_(const void *key, const char *lbl)
