@@ -1089,8 +1089,12 @@ static const struct db_migration dbmigrations[] = {
     /* fork (inr2-splice-harness) #125: durable storage for the exact
      * commitment_signed bytes signed during splice rounds; the crash
      * resume replays them instead of re-signing (the R7.2 retransmit
-     * contract; lightning-playground #125/#116). */
-    {SQL("CREATE TABLE sent_commitsigs ("
+     * contract; lightning-playground #125/#116).
+     * IF NOT EXISTS: v26.06.8's upgrade-repair tests rewind the db
+     * version by 2 and re-run the tail migrations - upstream's repair
+     * migrations are idempotent UPDATEs, so ours must be idempotent too
+     * (a bare CREATE dies with "table already exists"). */
+    {SQL("CREATE TABLE IF NOT EXISTS sent_commitsigs ("
 	 "  channel_id BIGINT NOT NULL"
 	 ", commitnum BIGINT NOT NULL"
 	 ", batch BLOB"
