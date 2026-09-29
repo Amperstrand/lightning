@@ -232,7 +232,7 @@ static u8 *hsmd_status_bad_request_fmt(struct hsmd_client *client,
 	char *str;
 
 	va_start(ap, fmt);
-	str = tal_fmt(tmpctx, fmt, ap);
+	str = tal_vfmt(tmpctx, fmt, ap);
 	va_end(ap);
 	return hsmd_status_bad_request(client, msg, str);
 }
@@ -2592,4 +2592,12 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		    NULL, hsmd_version, caps,
 		    &node_id, &secretstuff.bip32,
 		    &bolt12, tlvs));
+}
+
+void hsmd_deinit(void)
+{
+	/* Frees off NULL, so it also fires the mlock_tal_memory destructor
+	 * which wipes and munlocks it. */
+	secretstuff.bip32_seed = tal_free(secretstuff.bip32_seed);
+	initialized = false;
 }

@@ -120,7 +120,7 @@ static bool handle_blinded_forward(const tal_t *ctx,
 	/* amt_to_forward = ceil((amount_msat - fee_base_msat) * 1000000 / (1000000 + fee_proportional_millionths)) */
 	/* If these values are crap, that's OK: the HTLC will fail. */
 	p->amt_to_forward = amount_msat(ceil_div((amt - enc->payment_relay->fee_base_msat) * 1000000,
-						 1000000 + enc->payment_relay->fee_proportional_millionths));
+						 (u64)1000000 + enc->payment_relay->fee_proportional_millionths));
 	p->outgoing_cltv = cltv_expiry - enc->payment_relay->cltv_expiry_delta;
 	return true;
 }
@@ -360,8 +360,8 @@ struct onion_payload *onion_decode(const tal_t *ctx,
 				goto field_bad;
 		}
 
-		/* We stash path_id (if present and valid!) in payment_secret */
-		if (tal_bytelen(enc->path_id) == sizeof(*p->payment_secret)) {
+		/* We stash path_id (if present and valid!) in payment_secret for final hop */
+		if (p->final && tal_bytelen(enc->path_id) == sizeof(*p->payment_secret)) {
 			p->payment_secret = tal_steal(p,
 						      (struct secret *)enc->path_id);
 		} else

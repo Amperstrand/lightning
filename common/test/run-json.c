@@ -226,6 +226,119 @@ static void test_json_bad_utf8(void)
 	assert(json_parse_simple(tmpctx, buf, strlen(buf)));
 }
 
+static void test_json_deep_nesting(void)
+{
+	char *buf;
+	size_t d, i;
+
+	/* Arrays nested exactly at the limit still parse. */
+	d = JSON_MAX_NESTING;
+	buf = tal_arr(tmpctx, char, 2 * d + 2);
+	memset(buf, '[', d);
+	buf[d] = '0';
+	memset(buf + d + 1, ']', d);
+	buf[2 * d + 1] = '\0';
+	assert(json_parse_simple(tmpctx, buf, 2 * d + 1));
+
+	/* One level deeper is rejected, not crashed. */
+	d = JSON_MAX_NESTING + 1;
+	buf = tal_arr(tmpctx, char, 2 * d + 2);
+	memset(buf, '[', d);
+	buf[d] = '0';
+	memset(buf + d + 1, ']', d);
+	buf[2 * d + 1] = '\0';
+	assert(!json_parse_simple(tmpctx, buf, 2 * d + 1));
+
+	/* A pathologically deep array is rejected iteratively, without
+	 * overflowing the stack. */
+	d = 100000;
+	buf = tal_arr(tmpctx, char, 2 * d + 2);
+	memset(buf, '[', d);
+	buf[d] = '0';
+	memset(buf + d + 1, ']', d);
+	buf[2 * d + 1] = '\0';
+	assert(!json_parse_simple(tmpctx, buf, 2 * d + 1));
+
+	/* Same for deeply nested objects. */
+	buf = tal_strdup(tmpctx, "");
+	for (i = 0; i < 100000; i++)
+		tal_append_fmt(&buf, "{\"a\":");
+	tal_append_fmt(&buf, "1");
+	for (i = 0; i < 100000; i++)
+		tal_append_fmt(&buf, "}");
+	assert(!json_parse_simple(tmpctx, buf, strlen(buf)));
+}
+
+static void do_json_to_s64(const char *val, bool ok, s64 expected)
+{
+	const jsmntok_t *toks;
+	const char *buf;
+	s64 num;
+
+	buf = tal_fmt(tmpctx, "{\"v\": %s}", val);
+	toks = json_parse_simple(tmpctx, buf, strlen(buf));
+	assert(toks);
+	/* toks[0] is the object, toks[1] the key, toks[2] the value. */
+	assert(json_to_s64(buf, &toks[2], &num) == ok);
+	if (ok)
+		assert(num == expected);
+}
+
+static void test_json_to_s64(void)
+{
+	do_json_to_s64("0", true, 0);
+	do_json_to_s64("1555", true, 1555);
+	do_json_to_s64("-32602", true, -32602);
+	do_json_to_s64("-0", true, 0);
+
+	/* A leading zero is decimal, not octal. */
+	do_json_to_s64("01555", true, 1555);
+	do_json_to_s64("00", true, 0);
+	do_json_to_s64("-01555", true, -1555);
+
+	/* Hex is not a JSON number. */
+	do_json_to_s64("0x10", false, 0);
+
+	/* Neither is a bare sign, nor trailing garbage. */
+	do_json_to_s64("-", false, 0);
+	do_json_to_s64("1e3", false, 0);
+	do_json_to_s64("\"\"", false, 0);
+
+	/* Limits. */
+	do_json_to_s64("9223372036854775807", true, INT64_MAX);
+	do_json_to_s64("-9223372036854775808", true, INT64_MIN);
+	do_json_to_s64("9223372036854775808", false, 0);
+	do_json_to_s64("-9223372036854775809", false, 0);
+	do_json_to_s64("18446744073709551616", false, 0);
+}
+
+static void do_json_to_u64(const char *val, bool ok, u64 expected)
+{
+	const jsmntok_t *toks;
+	const char *buf;
+	u64 num;
+
+	buf = tal_fmt(tmpctx, "{\"v\": %s}", val);
+	toks = json_parse_simple(tmpctx, buf, strlen(buf));
+	assert(toks);
+	assert(json_to_u64(buf, &toks[2], &num) == ok);
+	if (ok)
+		assert(num == expected);
+}
+
+static void test_json_to_u64(void)
+{
+	do_json_to_u64("0", true, 0);
+	do_json_to_u64("1555", true, 1555);
+	/* A leading zero is decimal, not octal. */
+	do_json_to_u64("01555", true, 1555);
+	/* Hex is not a JSON number. */
+	do_json_to_u64("0x10", false, 0);
+	do_json_to_u64("-1", false, 0);
+	do_json_to_u64("18446744073709551615", true, UINT64_MAX);
+	do_json_to_u64("18446744073709551616", false, 0);
+}
+
 int main(int argc, char *argv[])
 {
 	common_setup(argv[0]);
@@ -234,6 +347,9 @@ int main(int argc, char *argv[])
 	test_json_tok_bitcoin_amount();
 	test_json_tok_millionths();
 	test_json_bad_utf8();
+	test_json_deep_nesting();
+	test_json_to_s64();
+	test_json_to_u64();
 
 	common_shutdown();
 }

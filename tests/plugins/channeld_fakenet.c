@@ -959,10 +959,12 @@ failed:
 
 static void handle_feerates(struct info *info, const u8 *inmsg)
 {
-	u32 feerate, min, max, penalty, opening, splicing;
+	u32 feerate, min, max, our_max, penalty, opening, splicing;
+	bool ignore_fee_limits;
 
 	if (!fromwire_channeld_feerates(inmsg, &feerate,
-					&min, &max, &penalty, &opening,
+					&min, &max, &our_max,
+					&ignore_fee_limits, &penalty, &opening,
 					&splicing))
 		master_badmsg(WIRE_CHANNELD_FEERATES, inmsg);
 
@@ -1056,6 +1058,8 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	struct penalty_base *pbases;
 	struct channel_type *channel_type;
 	u32 feerate_splice, feerate_min, feerate_max, feerate_penalty, feerate_opening;
+	u32 our_feerate_max;
+	bool ignore_fee_limits;
 	struct pubkey remote_per_commit;
 	struct pubkey old_remote_per_commit;
 	u32 commit_msec;
@@ -1065,7 +1069,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	u8 channel_flags;
 	bool channel_ready[NUM_SIDES];
 	u64 next_index[NUM_SIDES];
-	u64 htlc_id;
+	u64 htlc_id, their_htlc_id;
 	struct bitcoin_signature their_commit_sig;
 	struct short_channel_id short_channel_ids[NUM_SIDES];
 	bool send_shutdown;
@@ -1098,6 +1102,8 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &feerate_splice,
 				    &feerate_min,
 				    &feerate_max,
+				    &our_feerate_max,
+				    &ignore_fee_limits,
 				    &feerate_penalty,
 				    &feerate_opening,
 				    &their_commit_sig,
@@ -1116,6 +1122,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &next_index[REMOTE],
 				    &revocations_received,
 				    &htlc_id,
+				    &their_htlc_id,
 				    &htlcs,
 				    &channel_ready[LOCAL],
 				    &channel_ready[REMOTE],

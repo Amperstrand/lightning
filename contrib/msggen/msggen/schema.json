@@ -15947,11 +15947,10 @@
               "unusual",
               "info",
               "debug",
-              "trace",
-              "io"
+              "trace"
             ],
             "description": [
-              "A string that represents the log level."
+              "A string that represents the log level. Note that *io* is not accepted here; io logs are available only in the log file, via *log-level=io*."
             ],
             "default": "*info*"
           }
@@ -25203,7 +25202,7 @@
                 "next_feerate": {
                   "type": "string",
                   "description": [
-                    "For inflight opens, the next feerate we'll use for the channel open."
+                    "For inflight opens, the next feerate we'll use for the channel open. Omitted if *last_feerate* admits no valid next feerate."
                   ]
                 },
                 "next_fee_step": {
@@ -26169,8 +26168,7 @@
                     "additionalProperties": false,
                     "required": [
                       "initial_feerate",
-                      "last_feerate",
-                      "next_feerate"
+                      "last_feerate"
                     ],
                     "properties": {
                       "state": {},
@@ -26264,7 +26262,7 @@
                       "next_feerate": {
                         "type": "string",
                         "description": [
-                          "The minimum feerate for the next funding transaction in per-1000-weight, with `kpw` appended."
+                          "The minimum feerate for the next funding transaction in per-1000-weight, with `kpw` appended. Omitted if *last_feerate* admits no valid next feerate."
                         ]
                       }
                     }
@@ -28079,7 +28077,9 @@
       "rpc": "makesecret",
       "title": "Command for deriving pseudorandom key from HSM",
       "description": [
-        "The **makesecret** RPC command derives a secret key from the HSM_secret."
+        "The **makesecret** RPC command derives a secret key from the HSM_secret.",
+        "",
+        "The value `commando` (as `string`, or the same bytes as `hex`) is reserved: it derives the secret behind the node's runes, so it is refused."
       ],
       "request": {
         "required": [],
@@ -28116,7 +28116,8 @@
       "errors": [
         "The following error codes may occur:",
         "",
-        "- -1: Catchall nonspecific error."
+        "- -1: Catchall nonspecific error.",
+        "- -32602: The requested value is reserved for internal use."
       ],
       "author": [
         "Aditya [aditya.sharma20111@gmail.com](mailto:aditya.sharma20111@gmail.com) is mainly responsible."
@@ -33663,7 +33664,7 @@
             "added": "v23.08",
             "type": "boolean",
             "description": [
-              "If set to True means to allow the peer to set the commitment transaction fees (or closing transaction fees) to any value they want. This is dangerous: they could set an exorbitant fee (so HTLCs are unenforcable), or a tiny fee (so that commitment transactions cannot be relayed), but avoids channel breakage in case of feerate disagreements. (Note: the global `ignore_fee_limits` setting overrides this)."
+              "If set to True means to allow the peer to set the commitment transaction fees (or closing transaction fees) to any value they want, up to a maximum of 1000000perkw (4000 sat/vB). This is dangerous: they could set an exorbitant fee (so HTLCs are unenforcable), or a tiny fee (so that commitment transactions cannot be relayed), but avoids channel breakage in case of feerate disagreements. (Note: the global `ignore_fee_limits` setting overrides this)."
             ]
           }
         }

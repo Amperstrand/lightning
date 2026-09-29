@@ -65,7 +65,11 @@ bool json_to_u64(const char *buffer, const jsmntok_t *tok, u64 *num)
 	unsigned long long l;
 
 	errno = 0;
-	l = strtoull(buffer + tok->start, &end, 0);
+	/* Decimal only, as for json_to_s64 below; and strtoull would
+	 * happily negate a leading '-', which is not an unsigned number. */
+	if (tok->start == tok->end || buffer[tok->start] == '-')
+		return false;
+	l = strtoull(buffer + tok->start, &end, 10);
 	if (end != buffer + tok->end)
 		return false;
 
@@ -88,8 +92,10 @@ bool json_to_s64(const char *buffer, const jsmntok_t *tok, s64 *num)
 	long long l;
 
 	errno = 0;
-	l = strtoll(buffer + tok->start, &end, 0);
-	if (end != buffer + tok->end)
+	/* From json.org: "A number is very much like a C or Java number,
+	 * except that the octal and hexadecimal formats are not used." */
+	l = strtoll(buffer + tok->start, &end, 10);
+	if (tok->start == tok->end || end != buffer + tok->end)
 		return false;
 
 	BUILD_ASSERT(sizeof(l) >= sizeof(*num));
@@ -192,6 +198,47 @@ const jsmntok_t *json_next(const jsmntok_t *tok)
 		t = json_next(t);
 
 	return t;
+}
+
+/* We refuse JSON nested deeper than this.  jsmn tokenizes iteratively, but
+ * json_next() and the validators below recurse once per nesting level, so an
+ * unbounded depth overflows the C stack.  Real JSON-RPC and BOLT payloads nest
+ * only a handful of levels; this sits far above them and far below the stack
+ * limit.  Enforced in json_parse_input(), so every token array handed to
+ * json_next() and friends elsewhere has already been bounded. */
+#define JSON_MAX_NESTING 256
+
+/* Iteratively count the tokens in the first datum of toks[], rejecting
+ * anything nested deeper than JSON_MAX_NESTING.  On success sets *len to the
+ * token count (as json_next(toks) - toks would) and returns true; returns
+ * false without recursing on over-nested, attacker-controlled input. */
+static bool bounded_datum_len(const jsmntok_t *toks, size_t *len)
+{
+	/* remaining[d] = child datums still to visit at nesting level d;
+	 * level 0 holds the single root datum. */
+	size_t remaining[JSON_MAX_NESTING + 1];
+	size_t depth = 0, i = 0;
+
+	remaining[0] = 1;
+	for (;;) {
+		/* Ascend out of every level we have finished. */
+		while (remaining[depth] == 0) {
+			if (depth == 0) {
+				*len = i;
+				return true;
+			}
+			depth--;
+		}
+		remaining[depth]--;
+
+		/* Descend into this token's children, if it has any. */
+		if (toks[i].size != 0) {
+			if (depth == JSON_MAX_NESTING)
+				return false;
+			remaining[++depth] = toks[i].size;
+		}
+		i++;
+	}
 }
 
 const jsmntok_t *json_get_membern(const char *buffer,
@@ -518,8 +565,11 @@ again:
 	/* If we read a partial element at the end of the stream we'll get a
 	 * errro, but due to the previous check we know we read at
 	 * least one full element, so count tokens that are part of this root
-	 * element. */
-	ret = json_next(*toks) - *toks;
+	 * element.  Bound the nesting depth here, before any recursive walk. */
+	size_t datumlen;
+	if (!bounded_datum_len(*toks, &datumlen))
+		return false;
+	ret = datumlen;
 
 	if (!validate_jsmn_parse_output(input, *toks, *toks + ret))
 		return false;

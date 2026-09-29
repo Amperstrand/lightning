@@ -142,12 +142,21 @@ static void send_offer(struct per_peer_state *pps,
 		       struct amount_sat our_dust_limit,
 		       struct amount_sat fee_to_offer,
 		       const struct bitcoin_outpoint *wrong_funding,
-		       const struct tlv_closing_signed_tlvs_fee_range *tlv_fees)
+		       const struct tlv_closing_signed_tlvs_fee_range *tlv_fees,
+		       struct amount_sat max_fee_to_accept)
 {
 	struct bitcoin_tx *tx;
 	struct bitcoin_signature our_sig;
 	struct tlv_closing_signed_tlvs *close_tlvs;
 	u8 *msg;
+
+	/* We can arrive here in multiple ways, so add a final sanity check
+	 * that we did not go over our max fee */
+	if (amount_sat_greater(fee_to_offer, max_fee_to_accept))
+		peer_failed_warn(pps, channel_id, "Fee %s became larger than our"
+				 " max fee %s",
+				 fmt_amount_sat(tmpctx, fee_to_offer),
+				 fmt_amount_sat(tmpctx, max_fee_to_accept));
 
 	/* BOLT #2:
 	 *
@@ -206,10 +215,12 @@ static void send_offer(struct per_peer_state *pps,
 	peer_write(pps, take(msg));
 }
 
-static void tell_master_their_offer(const struct bitcoin_signature *their_sig,
+/* Returns false if master says we must not agree to this offer. */
+static bool tell_master_their_offer(const struct bitcoin_signature *their_sig,
 				    const struct bitcoin_tx *tx,
 				    struct bitcoin_txid *tx_id)
 {
+	bool acceptable;
 	u8 *msg = towire_closingd_received_signature(NULL, their_sig, tx);
 	if (!wire_sync_write(REQ_FD, take(msg)))
 		status_failed(STATUS_FAIL_MASTER_IO,
@@ -218,9 +229,11 @@ static void tell_master_their_offer(const struct bitcoin_signature *their_sig,
 
 	/* Wait for master to ack, to make sure it's in db. */
 	msg = wire_sync_read(NULL, REQ_FD);
-	if (!fromwire_closingd_received_signature_reply(msg, tx_id))
+	if (!fromwire_closingd_received_signature_reply(msg, tx_id,
+							&acceptable))
 		master_badmsg(WIRE_CLOSINGD_RECEIVED_SIGNATURE_REPLY, msg);
 	tal_free(msg);
+	return acceptable;
 }
 
 /* Returns fee they offered. */
@@ -375,7 +388,17 @@ receive_offer(struct per_peer_state *pps,
 	/* Master sorts out what is best offer, we just tell it any above min */
 	if (amount_sat_greater_eq(received_fee, min_fee_to_accept)) {
 		status_debug("...offer is reasonable");
-		tell_master_their_offer(&their_sig, tx, closing_txid);
+		/* Our own closing_signed for this round has usually gone
+		 * out by now (the opener sends first), so if their fee
+		 * matched ours they hold both signatures and can broadcast
+		 * the close whatever we do here.  Refusing only keeps us
+		 * from recording the close as agreed.  lightningd checks
+		 * the fee against the same bounds we negotiate within, so
+		 * this is not expected to fire. */
+		if (!tell_master_their_offer(&their_sig, tx, closing_txid))
+			peer_failed_warn(pps, channel_id,
+					 "Closing fee %s is outside our fee limits",
+					 fmt_amount_sat(tmpctx, received_fee));
 	}
 
 	return received_fee;
@@ -731,7 +754,8 @@ static void do_quickclose(struct amount_sat offer[NUM_SIDES],
 				   our_dust_limit,
 				   offer[LOCAL],
 				   wrong_funding,
-				   our_feerange);
+				   our_feerange,
+				   our_feerange->max_fee_satoshis);
 		}
 	} else {
 		/* BOLT #2:
@@ -767,7 +791,8 @@ static void do_quickclose(struct amount_sat offer[NUM_SIDES],
 			   our_dust_limit,
 			   offer[LOCAL],
 			   wrong_funding,
-			   our_feerange);
+			   our_feerange,
+			   our_feerange->max_fee_satoshis);
 
 		/* They will reply unless we completely agreed. */
 		if (!amount_sat_eq(offer[LOCAL], offer[REMOTE])) {
@@ -941,7 +966,8 @@ int main(int argc, char *argv[])
 				   our_dust_limit,
 				   offer[LOCAL],
 				   wrong_funding,
-				   our_feerange);
+				   our_feerange,
+				   max_fee_to_accept);
 		} else {
 			if (i == 0)
 				peer_billboard(false, "Waiting for their initial"
@@ -1011,7 +1037,8 @@ int main(int argc, char *argv[])
 				   our_dust_limit,
 				   offer[LOCAL],
 				   wrong_funding,
-				   our_feerange);
+				   our_feerange,
+				   max_fee_to_accept);
 		} else {
 			peer_billboard(false, "Waiting for another"
 				       " closing fee offer:"

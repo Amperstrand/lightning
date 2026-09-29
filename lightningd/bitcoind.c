@@ -277,12 +277,30 @@ static void estimatefees_callback(const char *buf, const jsmntok_t *toks,
 	if (floor < FEERATE_FLOOR)
 		floor = FEERATE_FLOOR;
 
+	/* Anything this high is a broken fee source, not a busy mempool:
+	 * clamp it rather than let it loose on the rest of lightningd. */
+	if (floor > FEERATE_CEILING) {
+		log_unusual(call->bitcoind->log,
+			    "Feerate floor (%u) is above sanity ceiling (%u):"
+			    " clamping!",
+			    floor, (u32)FEERATE_CEILING);
+		floor = FEERATE_CEILING;
+	}
+
 	/* FIXME: We could let this go below the dynamic floor, but we'd
 	 * need to know if the floor is because of their node's policy
 	 * (minrelaytxfee) or mempool conditions (mempoolminfee). */
 	for (size_t i = 0; i < tal_count(feerates); i++) {
 		feerates[i].rate = feerate_from_style(feerates[i].rate,
 						      FEERATE_PER_KBYTE);
+		if (feerates[i].rate > FEERATE_CEILING) {
+			log_unusual(call->bitcoind->log,
+				    "Feerate for %u blocks (%u) is above sanity"
+				    " ceiling (%u): clamping!",
+				    feerates[i].blockcount, feerates[i].rate,
+				    (u32)FEERATE_CEILING);
+			feerates[i].rate = FEERATE_CEILING;
+		}
 		if (feerates[i].rate < floor)
 			feerates[i].rate = floor;
 	}
@@ -760,8 +778,24 @@ static void process_getfilteredblock_step1(struct bitcoind *bitcoind,
 	}
 }
 
+/* Find the pending call for the highest block height: we prefer to
+ * satisfy the most recent request first, since it's usually the most
+ * urgent (e.g. catching up to the chain tip). */
+static struct filteredblock_call *
+most_recent_filteredblock_call(struct bitcoind *bitcoind)
+{
+	struct filteredblock_call *c, *best = NULL;
+
+	list_for_each(&bitcoind->pending_getfilteredblock, c, list) {
+		if (!best || c->height > best->height)
+			best = c;
+	}
+	return best;
+}
+
 /* Takes a call, dispatches it to all queued requests that match the same
- * height, and then kicks off the next call. */
+ * height, and then kicks off the call for the highest height still
+ * pending. */
 static void
 process_getfiltered_block_final(struct bitcoind *bitcoind,
 				const struct filteredblock_call *call)
@@ -786,8 +820,8 @@ next:
 	/* Nothing to free here, since `*call` was already deleted during the
 	 * iteration above. It was also removed from the list, so no need to
 	 * pop here. */
-	if (!list_empty(&bitcoind->pending_getfilteredblock)) {
-		c = list_top(&bitcoind->pending_getfilteredblock, struct filteredblock_call, list);
+	c = most_recent_filteredblock_call(bitcoind);
+	if (c) {
 		bitcoind_getrawblockbyheight(bitcoind, bitcoind, c->height,
 					     process_getfilteredblock_step1, c);
 	}

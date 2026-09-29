@@ -424,6 +424,14 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	/* Saved with channel to disk */
 	derive_channel_id(&cid, &funding);
 
+	/* Refuse to reuse the funding outpoint of an existing (or closed)
+	 * channel: the channel_id would collide. */
+	if (channel_id_in_use(ld, &cid, NULL)) {
+		uncommitted_channel_disconnect(fc->uc, LOG_UNUSUAL,
+					       "Funding outpoint already in use");
+		goto cleanup;
+	}
+
 	/* old_remote_per_commit not valid yet, copy valid one. */
 	channel_info.old_remote_per_commit = channel_info.remote_per_commit;
 
@@ -455,6 +463,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 
 	/* Watch for funding confirms */
 	channel_watch_funding(ld, channel);
+	channel_watch_inflight_outs(ld, channel);
 
 	if (pbase)
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
@@ -534,9 +543,12 @@ static void opening_fundee_finished(struct subd *openingd,
 	derive_channel_id(&cid, &funding);
 
 	/* A funding outpoint funds at most one channel; don't accept a second
-	 * channel reusing one we already have.  Drop the connection so the
-	 * peer's open fails cleanly instead of waiting for funding_signed. */
-	if (find_channel_by_funding_outpoint(uc->peer, &funding)) {
+	 * channel reusing one we already have, with this or any other peer,
+	 * open or closed: the channel_id would collide.  Drop the connection
+	 * so the peer's open fails cleanly instead of waiting for
+	 * funding_signed. */
+	if (find_channel_by_funding_outpoint(uc->peer, &funding)
+	    || channel_id_in_use(ld, &cid, NULL)) {
 		force_peer_disconnect(ld, uc->peer,
 				      "Funding outpoint already in use");
 		return;
@@ -572,6 +584,7 @@ static void opening_fundee_finished(struct subd *openingd,
 				 &channel->funding.txid));
 
 	channel_watch_funding(ld, channel);
+	channel_watch_inflight_outs(ld, channel);
 
 	/* Tell plugins about the success */
 	notify_channel_opened(ld, &channel->peer->id, &channel->funding_sats,
@@ -1001,13 +1014,9 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 		       &max_to_self_delay,
 		       &min_effective_htlc_capacity);
 
-	if (peer->ld->config.ignore_fee_limits) {
-		minrate = 1;
-		maxrate = 0xFFFFFFFF;
-	} else {
-		minrate = feerate_min(peer->ld, NULL);
-		maxrate = feerate_max(peer->ld, NULL);
-	}
+	/* openingd applies ignore_fee_limits itself, so these stay honest. */
+	minrate = feerate_min(peer->ld, NULL);
+	maxrate = feerate_max(peer->ld, NULL);
 
 	msg = towire_openingd_init(NULL,
 				   chainparams,
@@ -1020,6 +1029,7 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 				   &uc->local_funding_pubkey,
 				   uc->minimum_depth,
 				   minrate, maxrate,
+				   peer->ld->config.ignore_fee_limits,
 				   peer->ld->dev_force_tmp_channel_id,
 				   peer->ld->config.allowdustreserve,
 				   peer->ld->dev_any_channel_type);
@@ -1778,6 +1788,7 @@ static struct command_result *json_recoverchannel(struct command *cmd,
 
 		/* Watch the Funding */
 		channel_watch_funding(ld, channel);
+		channel_watch_inflight_outs(ld, channel);
 
 		json_add_channel_id(response, NULL, &scb_chan->cid);
 	}

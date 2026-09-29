@@ -41,6 +41,13 @@
 #include <openingd/openingd_wiregen.h>
 #include <unistd.h>
 
+/* Maximum simultaneous channel opens we'll negotiate with a single peer,
+ * counting both single- (open_channel) and dual-funded (open_channel2)
+ * attempts.  Each in-flight open holds an uncommitted/unsaved channel, HSM
+ * state, descriptors and an openingd/dualopend subdaemon, so we bound how many
+ * a peer may keep open at once. */
+#define MAX_INFLIGHT_OPENS 3
+
 /* FIXME: Reorder! */
 static void peer_disconnected(struct lightningd *ld,
 			      const struct node_id *id,
@@ -463,11 +470,29 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	} else {
 		const struct bitcoin_tx **txs = tal_arr(tmpctx, const struct bitcoin_tx*, 0);
 
-		/* We need to drop *every* commitment transaction to chain */
-		if (!cooperative && !list_empty(&channel->inflights)) {
+		/* We need to drop *every* commitment transaction to chain:
+		 * only one funding can end up confirmed, and until we know
+		 * which, each candidate's commitment is the one that would
+		 * close it.  Skipping channel->last_tx whenever an inflight
+		 * existed left the live channel's commitment unpublished when
+		 * the splice never confirmed, and let the peer settle that
+		 * branch on its own terms. */
+		if (!cooperative) {
+			bool have_current = false;
+			struct bitcoin_txid current_txid;
+
+			bitcoin_txid(channel->last_tx, &current_txid);
 			list_for_each(&channel->inflights, inflight, list) {
+				struct bitcoin_txid txid;
+
 				if (!inflight->last_tx)
 					continue;
+				/* Before a dual-funding candidate is promoted,
+				 * channel->last_tx is the latest attempt's
+				 * commitment: don't send it twice. */
+				bitcoin_txid(inflight->last_tx, &txid);
+				if (bitcoin_txid_eq(&txid, &current_txid))
+					have_current = true;
 				tal_arr_expand(&txs, sign_and_send_last(tmpctx,
 									ld,
 									channel,
@@ -475,11 +500,17 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 									inflight->last_tx,
 									&inflight->last_sig));
 			}
-		} else
+			if (!have_current)
+				tal_arr_expand(&txs, sign_and_send_last(tmpctx, ld,
+									channel, cmd_id,
+									channel->last_tx,
+									&channel->last_sig));
+		} else {
 			tal_arr_expand(&txs, sign_and_send_last(tmpctx, ld,
 								channel, cmd_id,
 								channel->last_tx,
 								&channel->last_sig));
+		}
 
 		resolve_close_command(ld, channel, cooperative, txs);
 	}
@@ -1047,14 +1078,13 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 		initial = list_top(&channel->inflights,
 				   struct channel_inflight, list);
 		json_add_string(response, "initial_feerate",
-			        tal_fmt(tmpctx, "%d%s",
+			        tal_fmt(tmpctx, "%u%s",
 					initial->funding->feerate,
 					feerate_style_name(FEERATE_PER_KSIPA)));
 
 		last_feerate = channel_last_funding_feerate(channel);
-		assert(last_feerate > 0);
 		json_add_string(response, "last_feerate",
-				tal_fmt(tmpctx, "%d%s", last_feerate,
+				tal_fmt(tmpctx, "%u%s", last_feerate,
 					feerate_style_name(FEERATE_PER_KSIPA)));
 
 		/* BOLT #2:
@@ -1062,11 +1092,21 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 		 * times the `feerate` of the previously constructed
 		 * transaction, rounded down.
 		 */
-		next_feerate = last_feerate * 25 / 24;
-		assert(next_feerate > last_feerate);
-		json_add_string(response, "next_feerate",
-				tal_fmt(tmpctx, "%d%s", next_feerate,
-					feerate_style_name(FEERATE_PER_KSIPA)));
+		/* The bounds and the migration together keep last_feerate in
+		 * range, so this holds; we used to assert it.  But this is
+		 * read-only introspection that plugins call at startup, and
+		 * aborting here would turn one bad row into a crash-loop with
+		 * no RPC left to repair it with. */
+		if (next_funding_feerate(last_feerate, &next_feerate)) {
+			json_add_string(response, "next_feerate",
+					tal_fmt(tmpctx, "%u%s", next_feerate,
+						feerate_style_name(FEERATE_PER_KSIPA)));
+		} else {
+			log_broken(channel->log,
+				   "Funding feerate %u leaves no valid next"
+				   " feerate: omitting next_feerate",
+				   last_feerate);
+		}
 
 		/* List the inflights */
 		json_array_start(response, "inflight");
@@ -1081,7 +1121,7 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 			json_add_num(response, "funding_outnum",
 				     inflight->funding->outpoint.n);
 			json_add_string(response, "feerate",
-					tal_fmt(tmpctx, "%d%s",
+					tal_fmt(tmpctx, "%u%s",
 						inflight->funding->feerate,
 						feerate_style_name(
 							FEERATE_PER_KSIPA)));
@@ -1998,6 +2038,50 @@ static void send_reestablish(struct peer *peer,
 							 msg)));
 }
 
+/* Is this a dual-funded open which has not reached the funding transaction
+ * yet?  All of these still own a dualopend, and none of them have a funding
+ * tx we could rely on to bound the peer's efforts. */
+static bool channel_state_opening(enum channel_state state)
+{
+	switch (state) {
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+		return true;
+	case CHANNELD_AWAITING_LOCKIN:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+		return false;
+	}
+	abort();
+}
+
+/* Count in-flight channel opens for this peer: the single-funded opening
+ * channel (if any) plus every dual-funded open which has not yet got a
+ * funding transaction. */
+static size_t num_inflight_opens(const struct peer *peer)
+{
+	struct channel *c;
+	size_t n = 0;
+
+	if (peer->uncommitted_channel)
+		n++;
+
+	list_for_each(&peer->channels, c, list) {
+		if (channel_state_opening(c->state))
+			n++;
+	}
+	return n;
+}
+
 /* connectd tells us a peer has a message and we've not already attached
  * a subd.  Normally this is a race, but it happens for real when opening
  * a new channel, or referring to a channel we no longer want to talk to
@@ -2009,10 +2093,11 @@ void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 	u64 connectd_counter;
 	struct channel *channel;
 	struct closed_channel *closed_channel;
+	struct closed_channel_map_iter cc_it;
 	struct channel_id channel_id;
 	struct peer *peer;
 	bool dual_fund;
-	const u8 *error;
+	const u8 *error = NULL;
 	int other_fd;
 	struct peer_fd *pfd;
 	char *errmsg;
@@ -2145,6 +2230,26 @@ void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 						"Didn't negotiate OPT_DUAL_FUND: cannot use open_channel2");
 			goto send_error;
 		}
+
+		/* Bound the number of concurrent opens from this peer.  We
+		 * reject before allocating any channel, HSM state or subdaemon,
+		 * keeping per-peer resource use bounded.  We disconnect rather
+		 * than just failing this open: connectd has already allocated a
+		 * subd for the temporary channel id and we have no way to make
+		 * it drop one, so leaving the connection up would let the peer
+		 * accumulate orphaned subds. */
+		if (num_inflight_opens(peer) >= MAX_INFLIGHT_OPENS) {
+			log_peer_debug(ld->log, &peer->id,
+				       "Rejecting open_channel2 %s: too many"
+				       " inflight opens (%zu)",
+				       fmt_channel_id(tmpctx, &channel_id),
+				       num_inflight_opens(peer));
+			error = towire_errorfmt(tmpctx, &channel_id,
+						"Too many inflight channel opens (max %u)",
+						MAX_INFLIGHT_OPENS);
+			goto send_error;
+		}
+
 		channel = new_unsaved_channel(peer,
 					      peer->ld->config.fee_base,
 					      peer->ld->config.fee_per_satoshi);
@@ -2161,7 +2266,8 @@ void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 
 	case WIRE_CHANNEL_REESTABLISH:
 		/* Maybe a previously closed channel? */
-		closed_channel = closed_channel_map_get(peer->ld->closed_channels, &channel_id);
+		closed_channel = closed_channel_map_getfirst(peer->ld->closed_channels,
+							     &channel_id, &cc_it);
 		if (closed_channel && closed_channel->their_shachain) {
 			send_reestablish(peer, &closed_channel->cid,
 					 closed_channel->their_shachain,
@@ -2488,15 +2594,100 @@ static void channel_funding_found(struct lightningd *ld,
 	}
 }
 
+/* A dual-funding candidate was mined and spent before lock-in. */
+static void adopt_opening_candidate(struct channel *channel,
+				    const struct channel_inflight *inflight)
+{
+	struct amount_msat our_msat;
+
+	log_unusual(channel->log,
+		    "Candidate funding %s spent before lock-in; adopting it",
+		    fmt_bitcoin_outpoint(tmpctx, &inflight->funding->outpoint));
+	update_channel_from_inflight(channel->peer->ld, channel, inflight,
+				     false);
+	if (amount_sat_to_msat(&our_msat, channel->our_funds)) {
+		channel->our_msat = our_msat;
+		channel->msat_to_us_min = our_msat;
+		channel->msat_to_us_max = our_msat;
+	}
+}
+
+/* A splice candidate was mined and spent before splice_locked, which
+ * needs the peer: do what handle_peer_splice_locked() would have. */
+static void adopt_splice_candidate(struct channel *channel,
+				   const struct channel_inflight *inflight)
+{
+	s64 splice_amnt = inflight->funding->splice_amnt;
+
+	log_unusual(channel->log,
+		    "Splice candidate %s spent before splice_locked;"
+		    " adopting it",
+		    fmt_bitcoin_outpoint(tmpctx, &inflight->funding->outpoint));
+	update_channel_from_inflight(channel->peer->ld, channel, inflight,
+				     true);
+	channel->our_msat.millisatoshis += splice_amnt * 1000; /* Raw: splicing */
+	channel->msat_to_us_min.millisatoshis += splice_amnt * 1000; /* Raw: splicing */
+	channel->msat_to_us_max.millisatoshis += splice_amnt * 1000; /* Raw: splicing */
+	wallet_channel_save(channel->peer->ld->wallet, channel);
+}
+
+/* The block scanner is iterating this outpoint's watches right now, and
+ * drop_to_chain() adds a funding_spend_watch if there is none: make the
+ * candidate watch that fired the channel's own instead of adding a second
+ * one on the same outpoint, which would fire funding_spent() again. */
+static void take_over_inflight_spend_watch(struct channel *channel,
+					   const struct bitcoin_outpoint *spent)
+{
+	size_t n = tal_count(channel->inflight_spend_watches);
+
+	for (size_t i = 0; i < n; i++) {
+		struct txowatch *w = channel->inflight_spend_watches[i];
+
+		if (!txowatch_eq(w, spent))
+			continue;
+		tal_free(channel->funding_spend_watch);
+		channel->funding_spend_watch = tal_steal(channel, w);
+		memmove(channel->inflight_spend_watches + i,
+			channel->inflight_spend_watches + i + 1,
+			(n - i - 1) * sizeof(*channel->inflight_spend_watches));
+		tal_resize(&channel->inflight_spend_watches, n - 1);
+		return;
+	}
+}
+
 static enum watch_result funding_spent(struct channel *channel,
 				       const struct bitcoin_tx *tx,
-				       size_t inputnum UNUSED,
+				       size_t inputnum,
 				       const struct block *block)
 {
 	struct bitcoin_txid txid;
+	struct bitcoin_outpoint spent;
 	struct channel_inflight *inflight;
 
 	bitcoin_txid(tx, &txid);
+
+	/* A candidate spent before it was locked in: whichever candidate
+	 * was spent is the one that got mined, so make it the channel's
+	 * funding (as opening_depth_cb or splice_locked would have) before
+	 * onchaind sees it.  Otherwise onchaind is handed a commitment for
+	 * the previous funding, or for an outpoint that may never exist.
+	 * This also covers our own force close with an inflight, where
+	 * drop_to_chain() publishes a commitment for every candidate. */
+	bitcoin_tx_input_get_outpoint(tx, inputnum, &spent);
+	take_over_inflight_spend_watch(channel, &spent);
+	if (!bitcoin_outpoint_eq(&spent, &channel->funding)) {
+		list_for_each(&channel->inflights, inflight, list) {
+			if (!bitcoin_outpoint_eq(&spent,
+						 &inflight->funding->outpoint))
+				continue;
+			/* No scid yet: this is a dual-funding candidate. */
+			if (channel->scid)
+				adopt_splice_candidate(channel, inflight);
+			else
+				adopt_opening_candidate(channel, inflight);
+			break;
+		}
+	}
 
 	/* If we're doing a splice, we expect the funding transaction to be
 	 * spent, so don't freak out and just keep watching in that case */
@@ -2537,6 +2728,21 @@ void channel_watch_funding_out(struct lightningd *ld, struct channel *channel)
 	channel->funding_spend_watch = watch_txo(channel, ld->topology, channel,
 						 &channel->funding,
 						 funding_spent);
+}
+
+void channel_watch_inflight_outs(struct lightningd *ld, struct channel *channel)
+{
+	struct channel_inflight *inflight;
+
+	tal_free(channel->inflight_spend_watches);
+	channel->inflight_spend_watches = tal_arr(channel, struct txowatch*, 0);
+
+	list_for_each(&channel->inflights, inflight, list)
+		tal_arr_expand(&channel->inflight_spend_watches,
+			       watch_txo(channel->inflight_spend_watches,
+					 ld->topology, channel,
+					 &inflight->funding->outpoint,
+					 funding_spent));
 }
 
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)
@@ -2903,6 +3109,8 @@ static void setup_peer(struct peer *peer)
 			connect = true;
 		if (channel_important_filter(channel, NULL))
 			important = true;
+
+		channel_watch_inflight_outs(ld, channel);
 	}
 
 	/* Make sure connectd knows to try reconnecting (unless

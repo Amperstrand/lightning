@@ -33,6 +33,29 @@
  */
 #define FEERATE_FLOOR 253
 
+/*
+ * Sanity ceiling on any feerate estimate entering lightningd (sat/kw).
+ * This is a sanity bound rather than a policy limit: an estimate above it
+ * means a broken fee source rather than an expensive mempool, so it sits
+ * far above anything the real chain has ever seen (4000 sat/vB, several
+ * times the historical peak).  Clamping on the way in keeps every
+ * downstream feerate calculation working on a plausible number.
+ */
+#define FEERATE_CEILING 1000000
+
+/*
+ * The most we are ever willing to pay ourselves (sat/kw).
+ *
+ * Unlike FEERATE_CEILING this *is* a policy limit, and the two are
+ * deliberately an order of magnitude apart because they answer different
+ * questions.  FEERATE_CEILING bounds what we let a peer drive us to: their
+ * estimator being broken is not by itself worth dropping a channel over, so
+ * it only has to exclude the absurd.  This one bounds what we propose with
+ * our own money, where we can simply decline: 400 sat/vB is around 0.011 BTC
+ * for a bare anchor commitment, which we would rather not spend by accident.
+ */
+#define MAX_OUR_FEERATE_PER_KW 100000
+
 enum feerate_style {
 	FEERATE_PER_KSIPA,
 	FEERATE_PER_KBYTE
@@ -56,5 +79,17 @@ static inline u32 feerate_floor_check(void)
 u32 feerate_from_style(u32 feerate, enum feerate_style style);
 u32 feerate_to_style(u32 feerate_perkw, enum feerate_style style);
 const char *feerate_style_name(enum feerate_style style);
+
+/* Sets *next_feerate to the smallest feerate which satisfies the BOLT #2
+ * rule that the next funding transaction pays 25/24 times the feerate of
+ * the previously constructed one, rounded down, and returns true.  Returns
+ * false, leaving *next_feerate untouched, if last_feerate admits no such
+ * value: it is 0, or 25/24 of it does not fit a u32, or rounding down lands
+ * back on last_feerate.
+ *
+ * last_feerate is generally read back out of the database, where a broken
+ * fee estimator (ours or a peer's) may have left something absurd, so
+ * callers must handle false rather than assume it away. */
+bool next_funding_feerate(u32 last_feerate, u32 *next_feerate);
 
 #endif /* LIGHTNING_BITCOIN_FEERATE_H */

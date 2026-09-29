@@ -1,5 +1,6 @@
 #include "config.h"
 #include <bitcoin/chainparams.h>
+#include <ccan/array_size/array_size.h>
 #include <common/amount.h>
 #include <common/pseudorand.h>
 #include <common/setup.h>
@@ -262,6 +263,47 @@ int main(int argc, char *argv[])
 	struct wireaddr decoded_wa;
 	assert(fromwire_wireaddr((const u8 **) &encoded_wa, &encoded_wa_len, &decoded_wa) == FROMWIREADDR_OK);
 	assert(wireaddr_eq(&wa, &decoded_wa));
+
+	/* A DNS descriptor which isn't actually a hostname is ignored, rather
+	 * than handed on to the rest of the daemon. */
+	const char *baddnsaddrs[] = { "",
+				      "not a hostname",
+				      "invalid..example.com",
+				      "-.invalid.com" };
+
+	for (size_t i = 0; i < ARRAY_SIZE(baddnsaddrs); i++) {
+		struct wireaddr bad_wa = {
+			.type = ADDR_TYPE_DNS,
+			.addrlen = strlen(baddnsaddrs[i]),
+			.port = DEFAULT_PORT
+		};
+		memcpy(bad_wa.addr, baddnsaddrs[i], bad_wa.addrlen);
+
+		u8 *encoded_bad = tal_arr(tmpctx, u8, 0);
+		towire_wireaddr(&encoded_bad, &bad_wa);
+		size_t encoded_bad_len = tal_bytelen(encoded_bad);
+
+		struct wireaddr decoded_bad;
+		assert(fromwire_wireaddr((const u8 **) &encoded_bad,
+					 &encoded_bad_len,
+					 &decoded_bad) == FROMWIREADDR_IGNORE);
+	}
+
+	/* ...and we don't produce one either: a dns: address which isn't a
+	 * hostname is rejected at parse time, rather than accepted here and
+	 * silently dropped by every peer we announce it to. */
+	for (size_t i = 0; i < ARRAY_SIZE(baddnsaddrs); i++) {
+		struct wireaddr parsed;
+		const char *arg = tal_fmt(tmpctx, "dns:%s", baddnsaddrs[i]);
+		assert(parse_wireaddr(tmpctx, arg, DEFAULT_PORT, NULL,
+				      &parsed) != NULL);
+	}
+
+	/* A real hostname still works. */
+	struct wireaddr good_dns;
+	assert(parse_wireaddr(tmpctx, "dns:example.com", DEFAULT_PORT, NULL,
+			      &good_dns) == NULL);
+	assert(good_dns.type == ADDR_TYPE_DNS);
 
 	tal_free(expect);
 	common_shutdown();

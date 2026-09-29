@@ -1816,7 +1816,8 @@ def test_feerates(node_factory, anchors):
     feerates = l1.rpc.feerates('perkw')
     assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkb' not in feerates
-    assert feerates['perkw']['max_acceptable'] == 2**32 - 1
+    # No estimates: falls back to the ceiling, as min falls back to the floor.
+    assert feerates['perkw']['max_acceptable'] == 1000000
     assert feerates['perkw']['min_acceptable'] == 253
     assert feerates['perkw']['min_acceptable'] == 253
     assert feerates['perkw']['floor'] == 253
@@ -1827,7 +1828,7 @@ def test_feerates(node_factory, anchors):
     feerates = l1.rpc.feerates('perkb')
     assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkw' not in feerates
-    assert feerates['perkb']['max_acceptable'] == (2**32 - 1)
+    assert feerates['perkb']['max_acceptable'] == 1000000 * 4
     assert feerates['perkb']['min_acceptable'] == 253 * 4
     # Note: This is floored at the FEERATE_FLOOR constant (253)
     assert feerates['perkb']['floor'] == 1012
@@ -1945,6 +1946,35 @@ def test_feerates(node_factory, anchors):
     # These are always the non-zero-fee-anchors values.
     assert htlc_timeout_cost == htlc_feerate * 663 // 1000
     assert htlc_success_cost == htlc_feerate * 703 // 1000
+
+
+@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+def test_feerate_ceiling(node_factory):
+    """A broken fee source can't feed absurd feerates into the daemon."""
+    l1 = node_factory.get_node()
+
+    # bcli trims anything wider than a u32 of perkb down to exactly
+    # 0xFFFFFFFF.  That is also the interesting value for the conversion:
+    # (0xFFFFFFFF + 3) / 4 wraps to 0 on a u32, so before the conversion was
+    # widened this arrived as 0perkw and was quietly raised to the floor,
+    # i.e. an absurd fee source produced an absurdly *low* feerate and the
+    # ceiling never saw it.
+    def absurd_feerate(r):
+        return {'id': r['id'], 'error': None,
+                'result': {'feerate': Decimal(900000)}}
+
+    l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', absurd_feerate)
+    l1.restart()
+
+    l1.daemon.wait_for_log(r'is above sanity ceiling \(1000000\): clamping!')
+
+    feerates = l1.rpc.feerates('perkw')['perkw']
+    assert [e['feerate'] for e in feerates['estimates']] == [1000000] * 4
+    # max_fee_multiplier can't carry max_acceptable past the ceiling either.
+    assert feerates['max_acceptable'] == 1000000
+    # And what we're prepared to pay ourselves stays well under it.
+    assert feerates['opening'] <= 100000
+    assert feerates['splice'] <= 100000
 
 
 def test_logging(node_factory):
@@ -3797,8 +3827,28 @@ def test_getlog(node_factory):
     logs = l1.rpc.getlog()['log']
     assert [l for l in logs if l['type'] not in ("BROKEN", "UNUSUAL", "INFO")] == []
 
-    logs = l1.rpc.getlog(level='io')['log']
-    assert [l for l in logs if l['type'] not in ("BROKEN", "UNUSUAL", "INFO", "DEBUG", "TRACE", "IO_IN", "IO_OUT")] == []
+    logs = l1.rpc.getlog(level='trace')['log']
+    assert [l for l in logs if l['type'] not in ("BROKEN", "UNUSUAL", "INFO", "DEBUG", "TRACE")] == []
+
+
+def test_getlog_no_io(node_factory):
+    """getlog must not hand out io logs: they contain the raw JSON-RPC and
+    plugin traffic, which includes secrets such as runes."""
+    l1 = node_factory.get_node(options={'log-level': 'io'})
+
+    rune = l1.rpc.createrune()['rune']
+
+    # The schema doesn't allow it, but lightningd must refuse it too.
+    l1.rpc.check_request_schemas = False
+    with pytest.raises(RpcError, match='io logs are not available'):
+        l1.rpc.getlog(level='io')
+    l1.rpc.check_request_schemas = True
+
+    # Nor do the other levels expose raw traffic.
+    for level in ('trace', 'debug', 'info', 'unusual', 'broken'):
+        for entry in l1.rpc.getlog(level=level)['log']:
+            assert 'data' not in entry
+            assert rune not in entry.get('log', '')
 
 
 def test_log_filter(node_factory):
@@ -4910,8 +4960,11 @@ def test_set_feerate_offset(node_factory, bitcoind):
     else:
         feerate = 11100
         min_feerate = 1875
+    # our_max is what we're willing to pay ourselves (MAX_OUR_FEERATE_PER_KW),
+    # as opposed to max, which is what we'll tolerate from the peer.
     l1.daemon.wait_for_log(f'lightningd: update_feerates: feerate = {feerate}, '
-                           f'min={min_feerate}, max=150000, penalty=7500')
+                           f'min={min_feerate}, max=150000, our_max=100000, '
+                           f'penalty=7500')
     l2.daemon.wait_for_log(f'peer updated fee to {feerate}')
     l2.pay(l1, 100000000)
 

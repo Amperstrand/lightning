@@ -1,5 +1,6 @@
 #include "config.h"
 #include <bitcoin/script.h>
+#include <bitcoin/tx.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <closingd/closingd_wiregen.h>
@@ -7,6 +8,7 @@
 #include <common/json_command.h>
 #include <common/shutdown_scriptpubkey.h>
 #include <common/timeout.h>
+#include <common/utils.h>
 #include <errno.h>
 #include <hsmd/permissions.h>
 #include <inttypes.h>
@@ -168,11 +170,12 @@ register_close_command(struct lightningd *ld,
 			     &close_command_timeout, cc);
 }
 
-static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
-				     const struct bitcoin_tx *tx)
+static bool calc_tx_fee(struct channel *channel,
+			const struct bitcoin_tx *tx,
+			struct amount_sat *fee_result)
 {
 	struct amount_asset amt;
-	struct amount_sat fee = sat_in;
+	struct amount_sat sat_in = channel->funding_sats;
 
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		const struct wally_tx_output *txout = &tx->wtx->outputs[i];
@@ -185,12 +188,72 @@ static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
 		if (!amount_asset_is_main(&amt))
 			continue;
 
-		if (!amount_sat_sub(&fee, fee, amount_asset_to_sat(&amt)))
-			fatal("Tx spends more than input %s? %s",
-			      fmt_amount_sat(tmpctx, sat_in),
-			      fmt_bitcoin_tx(tmpctx, tx));
+		if (!amount_sat_sub(&sat_in, sat_in, amount_asset_to_sat(&amt))) {
+			/* Important we dont abort here incase we're force
+			 * closing due to things going wrong. */
+			log_unusual(channel->log,
+				   "Tx spends more than input %s? %s",
+				   fmt_amount_sat(tmpctx, sat_in),
+				   fmt_bitcoin_tx(tmpctx, tx));
+			return false;
+		}
 	}
-	return fee;
+	*fee_result = sat_in;
+	return true;
+}
+
+static u32 calc_max_close_feerate(struct lightningd *ld,
+				  struct channel *channel)
+{
+	u32 max_feerate;
+
+	/* Aim for reasonable max, but use final if we don't know. */
+	max_feerate = unilateral_feerate(ld->topology, false);
+	if (!max_feerate)
+		max_feerate = get_feerate(channel->fee_states,
+					  channel->opener, LOCAL);
+
+	/* If they specified feerates in `close`, they apply now! */
+	if (channel->closing_feerate_range)
+		max_feerate = channel->closing_feerate_range[1];
+
+	return max_feerate;
+}
+
+/* The fee closingd negotiated is what it took off our output (we only
+ * bound the fee when we are the opener, and the opener pays it).  The
+ * transaction itself pays more than that whenever the outputs' msat
+ * remainders were rounded away or an output was trimmed as dust: neither
+ * is a fee we chose, so neither counts against our maximum. */
+static bool negotiated_close_fee(const struct channel *channel,
+				 const struct bitcoin_tx *tx,
+				 struct amount_sat *fee)
+{
+	struct amount_sat ours = amount_msat_to_sat_round_down(channel->our_msat);
+	struct amount_sat out_amt;
+
+	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		const struct wally_tx_output *out = &tx->wtx->outputs[i];
+		const u8 *script = tal_dup_arr(tmpctx, u8,
+					       out->script, out->script_len, 0);
+		if (!scripteq(script, channel->shutdown_scriptpubkey[LOCAL]))
+			continue;
+		out_amt = bitcoin_tx_output_get_amount_sat(tx, i);
+		if (!amount_sat_sub(fee, ours, out_amt)) {
+			/* closingd built the tx from this same balance, so
+			 * this cannot underflow; count the whole fee if it
+			 * does. */
+			log_broken(channel->log,
+				   "Closing tx output %zu pays us %s,"
+				   " more than our balance %s",
+				   i, fmt_amount_sat(tmpctx, out_amt),
+				   fmt_amount_sat(tmpctx, ours));
+			return false;
+		}
+		return true;
+	}
+	/* Our output was trimmed: the fee is everything. */
+	return false;
 }
 
 /* Assess whether a proposed closing fee is acceptable. */
@@ -198,12 +261,15 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 				      struct channel *channel,
 				      const struct bitcoin_tx *tx)
 {
-	struct amount_sat fee, last_fee;
+	struct amount_sat fee, last_fee, negotiated;
 	u64 weight;
 
 	/* Calculate actual fee (adds in eliminated outputs) */
-	fee = calc_tx_fee(channel->funding_sats, tx);
-	last_fee = calc_tx_fee(channel->funding_sats, channel->last_tx);
+	if (!calc_tx_fee(channel, tx, &fee))
+		return false;
+
+	if (!calc_tx_fee(channel, channel->last_tx, &last_fee))
+		return false;
 
 	/* Weight once we add in sigs. */
 	assert(!tx->wtx->inputs[0].witness
@@ -216,12 +282,22 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 		  fmt_amount_sat(tmpctx, last_fee),
 		  weight);
 
+	if (ld->dev_reject_closing_fee) {
+		log_debug(channel->log, "... dev-reject-closing-fee");
+		return false;
+	}
+
 	if (!channel->ignore_fee_limits && !ld->config.ignore_fee_limits) {
-		struct amount_sat min_fee;
-		u32 min_feerate;
+		struct amount_sat min_fee, max_fee;
+		u32 min_feerate, max_feerate;
 
 		/* If we don't have a feerate estimate, this gives feerate_floor */
 		min_feerate = feerate_min(ld, NULL);
+		/* A feerange given to `close` is what closingd negotiated
+		 * within; its minimum is our floor too. */
+		if (channel->closing_feerate_range)
+			min_feerate = channel->closing_feerate_range[0];
+		max_feerate = calc_max_close_feerate(ld, channel);
 
 		min_fee = amount_tx_fee(min_feerate, weight);
 		if (amount_sat_less(fee, min_fee)) {
@@ -229,6 +305,19 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 				  " for weight %"PRIu64" at feerate %u",
 				  fmt_amount_sat(tmpctx, min_fee),
 				  weight, min_feerate);
+			return false;
+		}
+		max_fee = amount_tx_fee(max_feerate, weight);
+		if (!negotiated_close_fee(channel, tx, &negotiated))
+			negotiated = fee;
+		if (channel->opener == LOCAL
+		    && amount_sat_less(max_fee, negotiated)) {
+			log_debug(channel->log, "... Negotiated fee %s is above"
+				  " our max %s for weight %"PRIu64
+				  " at feerate %u",
+				  fmt_amount_sat(tmpctx, negotiated),
+				  fmt_amount_sat(tmpctx, max_fee),
+				  weight, max_feerate);
 			return false;
 		}
 	}
@@ -239,6 +328,62 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 	return true;
 }
 
+/* By policy we don't trust our subdaemons (much): before we store a
+ * closing transaction as the channel's last tx and broadcast it, check it
+ * really is a well-formed close of this channel.  It must spend exactly our
+ * funding outpoint, be shaped like a close rather than a commitment, and
+ * every output must go to a known shutdown script. */
+const char *close_tx_check(const tal_t *ctx,
+			   const struct channel *channel,
+			   const struct bitcoin_tx *tx)
+{
+	bool local_matched = false, remote_matched = false;
+
+	if (tx->wtx->num_inputs != 1)
+		return tal_fmt(ctx, "expected 1 input, got %zu",
+			tx->wtx->num_inputs);
+
+	if (!wally_tx_input_spends(&tx->wtx->inputs[0], &channel->funding))
+		return tal_fmt(ctx, "does not spend funding outpoint %s",
+			fmt_bitcoin_outpoint(ctx, &channel->funding));
+
+	/* A closing transaction has a standard nLockTime/nSequence (locktime
+	 * 0 or the negotiated value, sequence 0xFFFFFFF[DF]).  Anything shaped
+	 * like the commitment transactions we hand out - upper locktime byte
+	 * 0x20 and upper sequence byte 0x80 - is not a close, no
+	 * matter how its outputs happen to look. */
+	if ((tx->wtx->locktime >> 24) == 0x20
+	    && (tx->wtx->inputs[0].sequence >> 24) == 0x80)
+		return tal_fmt(ctx, "is not shaped like a closing transaction");
+
+	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		const struct wally_tx_output *out = &tx->wtx->outputs[i];
+		/* Elements has an explicit fee output with no script. */
+		if (out->script_len == 0) {
+			if (chainparams->is_elements)
+				continue;
+			return tal_fmt(ctx, "output %zu has no script", i);
+		}
+		const u8 *script = tal_dup_arr(ctx, u8,
+					       out->script, out->script_len, 0);
+		/* Only let each side's output match once. */
+		if (scripteq(script, channel->shutdown_scriptpubkey[LOCAL])
+		    && !local_matched) {
+			local_matched = true;
+			continue;
+		}
+		if (scripteq(script, channel->shutdown_scriptpubkey[REMOTE])
+		    && !remote_matched) {
+			remote_matched = true;
+			continue;
+		}
+		return tal_fmt(ctx,
+			"output %zu goes to unknown script %s",
+			i, tal_hex(ctx, script));
+	}
+	return NULL;
+}
+
 static void peer_received_closing_signature(struct channel *channel,
 					    const u8 *msg)
 {
@@ -247,6 +392,7 @@ static void peer_received_closing_signature(struct channel *channel,
 	struct bitcoin_txid tx_id;
 	struct lightningd *ld = channel->peer->ld;
 	u8 *funding_wscript;
+	bool acceptable;
 
 	if (!fromwire_closingd_received_signature(msg, msg, &sig, &tx)) {
 		channel_internal_error(channel,
@@ -255,6 +401,14 @@ static void peer_received_closing_signature(struct channel *channel,
 		return;
 	}
 	tx->chainparams = chainparams;
+
+	const char *err = close_tx_check(tmpctx, channel, tx);
+	if (err) {
+		channel_internal_error(channel,
+				       "Bad closing_received_signature: %s",
+				       err);
+		return;
+	}
 
 	funding_wscript = bitcoin_redeem_2of2(tmpctx,
 				       	      &channel->local_funding_pubkey,
@@ -267,17 +421,23 @@ static void peer_received_closing_signature(struct channel *channel,
 		return;
 	}
 
-	if (closing_fee_is_acceptable(ld, channel, tx)) {
+	acceptable = closing_fee_is_acceptable(ld, channel, tx);
+	if (acceptable) {
 		channel_set_last_tx(channel, tx, &sig);
 		wallet_channel_save(ld->wallet, channel);
-	}
+	} else
+		log_unusual(channel->log,
+			    "Rejecting peer's closing fee offer:"
+			    " closingd must not agree to it");
 
-
-	// Send back the txid so we can update the billboard on selection.
+	/* Send back the txid so closingd can update the billboard, and
+	 * whether it may agree to this offer at all.  Without the verdict
+	 * a rejected offer would still complete the close, and last_tx,
+	 * still the commitment, would be broadcast as the mutual close. */
 	bitcoin_txid(channel->last_tx, &tx_id);
-	/* OK, you can continue now. */
 	subd_send_msg(channel->owner,
-		      take(towire_closingd_received_signature_reply(channel, &tx_id)));
+		      take(towire_closingd_received_signature_reply(channel, &tx_id,
+								    acceptable)));
 }
 
 static void peer_closing_complete(struct channel *channel, const u8 *msg)
@@ -419,17 +579,13 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 			feerate = get_feerate_floor(ld->topology);
 	}
 
-	/* Aim for reasonable max, but use final if we don't know. */
-	max_feerate = unilateral_feerate(ld->topology, false);
-	if (!max_feerate)
-		max_feerate = final_commit_feerate;
+	max_feerate = calc_max_close_feerate(ld, channel);
 
 	min_feerate = feerate_min(ld, NULL);
 
 	/* If they specified feerates in `close`, they apply now! */
 	if (channel->closing_feerate_range) {
 		min_feerate = channel->closing_feerate_range[0];
-		max_feerate = channel->closing_feerate_range[1];
 	}
 
 	/* BOLT #3:

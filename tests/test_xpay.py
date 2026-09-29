@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError
-from pyln.testing.utils import FUNDAMOUNT, only_one
+from pyln.testing.utils import FUNDAMOUNT, only_one, scid_to_int
 from utils import (
     TIMEOUT, first_scid, first_scidd, GenChannel, generate_gossip_store, wait_for,
     sync_blockheight,
@@ -11,6 +11,7 @@ import ast
 import os
 import pytest
 import re
+import struct
 import subprocess
 import sys
 from hashlib import sha256
@@ -253,7 +254,7 @@ def test_xpay_fake_channeld(node_factory, bitcoind, chainparams, slow_mode):
                                             'allow_warning': True,
                                             'dev-throttle-gossip': None,
                                             'log-level': 'info',
-                                            'broken_log': 'Throttling incoming peer',
+                                            'broken_log': 'Throttling (incoming|outgoing) peer',
                                             # xpay gets upset if it's aging when we remove cln-askrene!
                                             'dev-xpay-no-age': None,
                                             },
@@ -975,6 +976,45 @@ def test_xpay_offer(node_factory):
     l1.rpc.xpay(offer2, 5000)
 
 
+def test_xpay_offer_invoice_amount_mismatch(node_factory):
+    """xpay must not pay an invoice whose amount isn't the one we asked for.
+
+    invoice_amount is not one of the fields the invoice has to echo from our
+    invoice_request, so the payee sets it independently.  BOLT #12 requires us
+    to reject the invoice if it doesn't equal the invreq_amount we sent, in
+    either direction.
+    """
+    plugin = Path(__file__).parent / "plugins" / "xpay_mismatched_invoice_amount.py"
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=True,
+                                     opts=[{'plugin': str(plugin)}, {}])
+
+    offer = l2.rpc.offer('any')['bolt12']
+
+    # Genuine, validly-signed invoices from l2, for amounts we won't ask for.
+    # Fetch both before arming the plugin, since it intercepts fetchinvoice.
+    larger = l1.rpc.fetchinvoice(offer, 10000000)['invoice']
+    smaller = l1.rpc.fetchinvoice(offer, 50000)['invoice']
+
+    before = only_one(l1.rpc.listpeerchannels()['channels'])['to_us_msat']
+    for inv, amount_msat in ((larger, 10000000), (smaller, 50000)):
+        l1.rpc.call('setinvoiceamount', {'invoice': inv,
+                                         'amount_msat': amount_msat})
+        with pytest.raises(RpcError, match=r"Invoice amount"):
+            l1.rpc.xpay(offer, 100000)
+        after = only_one(l1.rpc.listpeerchannels()['channels'])['to_us_msat']
+        assert before == after
+
+    # We send no invreq_amount when the offer has its own amount, so here the
+    # offer amount is what we authorized.
+    fixed = l2.rpc.offer('100000msat', 'fixed amount offer')['bolt12']
+    l1.rpc.call('setinvoiceamount', {'invoice': larger,
+                                     'amount_msat': 10000000})
+    with pytest.raises(RpcError, match=r"Invoice amount"):
+        l1.rpc.xpay(fixed)
+    after = only_one(l1.rpc.listpeerchannels()['channels'])['to_us_msat']
+    assert before == after
+
+
 def test_xpay_circular_routehint(node_factory):
     """Test that xpay gracefully skips a circular bolt11 routehint (src == dst)."""
     l1, l2 = node_factory.line_graph(2)
@@ -1265,6 +1305,52 @@ def test_xpay_error_update_fees(node_factory):
     assert ret["failed_parts"] == 1
     assert ret["successful_parts"] == 1
     l1.daemon.wait_for_log('We got fee_insufficient for .*, containing a channel_update: updating our map')
+
+
+def test_xpay_error_update_wrong_channel(node_factory):
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted-failmessage.py')
+    l1, l2, l3, l4, l5 = node_factory.line_graph(
+        5, opts=[{}, {'plugin': plugin}, {}, {}, {}], wait_for_announce=True)
+
+    # this is the channel which will actually fail (l2 fails every HTLC it gets)
+    real_scidd = first_scidd(l2, l3)
+
+    # an innocent channel elsewhere in the graph, nowhere near this route
+    victim_scidd = first_scidd(l4, l5)
+    victim_scid, victim_dir = victim_scidd.split('/')
+
+    channel_update = (
+        struct.pack('>H', 258)  # WIRE_CHANNEL_UPDATE
+        + bytes(64)  # signature - we don't check it
+        + bytes(32)  # chain_hash - irrelevant here
+        + struct.pack('>Q', scid_to_int(victim_scid))
+        + struct.pack('>I', 1)  # timestamp
+        + struct.pack('>B', 1)  # message_flags
+        + struct.pack('>B', int(victim_dir))  # channel_flags - enabled, given direction
+        + struct.pack('>H', 40)  # cltv_expiry_delta
+        + struct.pack('>Q', 0)  # htlc_minimum_msat
+        + struct.pack('>I', 999000)  # fee_base_msat - high
+        + struct.pack('>I', 42)  # fee_proportional_millionths
+        + struct.pack('>Q', 1000000)  # htlc_maximum_msat
+    )
+    failmsg = (struct.pack('>H', 0x1007)  # WIRE_TEMPORARY_CHANNEL_FAILURE
+               + struct.pack('>H', len(channel_update))
+               + channel_update).hex()
+    l2.rpc.setfailmsg(msg=failmsg)
+
+    inv = l3.rpc.invoice(123000, 'test_xpay_error_update_wrong_channel', 'desc')['bolt11']
+
+    with pytest.raises(RpcError, match=r'temporary_channel_failure'):
+        l1.rpc.xpay(inv)
+
+    l1.daemon.wait_for_log(
+        r"Ignoring channel_update for {} in error temporary_channel_failure:"
+        r" does not match failing channel {}".format(re.escape(victim_scidd),
+                                                     re.escape(real_scidd)))
+
+    # and we must not have treated it as a legitimate update
+    assert not l1.daemon.is_in_log(
+        r'Got channel_update from error for {}'.format(re.escape(victim_scidd)))
 
 
 def test_error_messages(node_factory):

@@ -25,23 +25,27 @@ use utoipa::{
 
 #[derive(Debug)]
 pub enum AppError {
+    BadRequest(RpcError),
     Unauthorized(RpcError),
     Forbidden(RpcError),
     NotFound(RpcError),
     MethodNotAllowed(RpcError),
     InternalServerError(RpcError),
     NotAcceptable(RpcError),
+    PayloadTooLarge(RpcError),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
+            AppError::BadRequest(err) => (StatusCode::BAD_REQUEST, err),
             AppError::Unauthorized(err) => (StatusCode::UNAUTHORIZED, err),
             AppError::Forbidden(err) => (StatusCode::FORBIDDEN, err),
             AppError::NotFound(err) => (StatusCode::NOT_FOUND, err),
             AppError::MethodNotAllowed(err) => (StatusCode::METHOD_NOT_ALLOWED, err),
             AppError::InternalServerError(err) => (StatusCode::INTERNAL_SERVER_ERROR, err),
             AppError::NotAcceptable(err) => (StatusCode::NOT_ACCEPTABLE, err),
+            AppError::PayloadTooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
         };
 
         let body = Json(json!(error_message));
@@ -52,12 +56,14 @@ impl IntoResponse for AppError {
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AppError::BadRequest(err) => write!(f, "Bad Request: {err}"),
             AppError::Unauthorized(err) => write!(f, "Unauthorized: {err}"),
             AppError::Forbidden(err) => write!(f, "Forbidden: {err}"),
             AppError::NotFound(err) => write!(f, "Not Found: {err}"),
             AppError::MethodNotAllowed(err) => write!(f, "Method not allowed: {err}"),
             AppError::InternalServerError(err) => write!(f, "Internal Server Error: {err}"),
             AppError::NotAcceptable(err) => write!(f, "Not Acceptable: {err}"),
+            AppError::PayloadTooLarge(err) => write!(f, "Payload Too Large: {err}"),
         }
     }
 }
