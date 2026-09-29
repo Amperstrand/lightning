@@ -3458,12 +3458,13 @@ static size_t calc_weight(enum tx_role role, const struct wally_psbt *psbt,
 static struct amount_msat
 relative_splice_balance_fundee(struct peer *peer,
 			       enum tx_role our_role,
-			       const struct wally_psbt *psbt,
-			       int chan_output_index,
-			       int chan_input_index)
+			       const struct wally_psbt *psbt UNUSED,
+			       int chan_output_index UNUSED,
+			       int chan_input_index UNUSED)
 {
 	/* Relative fundee channel balance */
-	u64 push_value;
+	s64 push_value_sat;
+	struct amount_msat push_value_msat;
 
 	/* We calculcate the `push_value` to send to the
 	 * hsmd, that is the remote amount in the channel
@@ -3472,19 +3473,33 @@ relative_splice_balance_fundee(struct peer *peer,
 	case TX_INITIATOR:
 		/* push_value is the fundee relative value so if we open the channel
 		 * fundee is the remote node. */
-		push_value = peer->splicing->accepter_relative;
+		push_value_sat = peer->splicing->accepter_relative;
 		break;
 	case TX_ACCEPTER:
 		/* push_value is the fundee relative value so if the remote node open the channel
 		 * fundee in this case is the opener. */
-		push_value = peer->splicing->opener_relative;
+		push_value_sat = peer->splicing->opener_relative;
 		break;
 	default:
 		/* This should never happen. Help us to early catch the tx_role change */
 		abort();
 	}
 
-	return amount_msat(push_value);
+	/* opener_relative/accepter_relative are SATOSHI funding contributions
+	 * (see their amount_msat_add_sat_s64 callers); the hsmd setup field is
+	 * amount_msat. Wrapping the raw value under-reported the fundee's
+	 * post-splice balance by 1000x, which a validating signer (VLS strict
+	 * policy-commitment-initial-funding-value) reads as an overpayment and
+	 * refuses - wedging the splice. */
+	if (push_value_sat < 0)
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "splice funding contribution negative");
+	if (!amount_sat_to_msat(&push_value_msat,
+				amount_sat(push_value_sat)))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "splice funding contribution overflow");
+
+	return push_value_msat;
 }
 
 static struct amount_sat calc_balance(struct peer *peer)
