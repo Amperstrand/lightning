@@ -3477,9 +3477,20 @@ relative_splice_balance_fundee(struct peer *peer,
 	 * post-splice balance by 1000x, which a validating signer (VLS strict
 	 * policy-commitment-initial-funding-value) reads as an overpayment and
 	 * refuses - wedging the splice. */
-	if (push_value_sat < 0)
-		peer_failed_warn(peer->pps, &peer->channel_id,
-				 "splice funding contribution negative");
+	if (push_value_sat < 0) {
+		/* A negative relative is a legitimate fundee-side withdrawal
+		 * (RBF rounds that reduce a side, splice-outs) - the fundee's
+		 * post-splice entitlement is carried - |r|. The unsigned push
+		 * field cannot carry the reduction, so we clamp to 0: the
+		 * signer's allowance stays push + carried = carried, which the
+		 * honest first new-era commitment (paying carried - |r|) never
+		 * exceeds. Bounded residual: the initial-commitment allowance
+		 * over-states by |r| until the era's commitment chain takes
+		 * over; exact precision needs a signer-side signed-relative
+		 * convention (owner-gated, lightning-playground #268). */
+		push_value_msat = AMOUNT_MSAT(0);
+		return push_value_msat;
+	}
 	if (!amount_sat_to_msat(&push_value_msat,
 				amount_sat(push_value_sat)))
 		peer_failed_warn(peer->pps, &peer->channel_id,

@@ -9,12 +9,15 @@
  *   MUST-ACCEPT: a 100000-sat contribution reaches the hsmd wire as
  *     push_value = 100_000_000 msat (parsed back out of the captured
  *     towire_hsmd_setup_channel message - the real wiregen, not a mock).
- *   MUST-REFUSE (i): a negative contribution peer-fails with
- *     "splice funding contribution negative" - never wrapped.
- *   MUST-REFUSE (ii): the 1000x fingerprint - for any nonzero
- *     contribution X sat the reported field is X*1000 msat, never X.
- *   MUST-REFUSE (iii): a contribution whose msat conversion overflows
- *     peer-fails with "splice funding contribution overflow".
+ *   MUST-ACCEPT (withdrawal clamp): a NEGATIVE relative (legitimate
+ *     fundee-side withdrawal: RBF rounds that reduce a side, splice-outs)
+ *     reports push_value = 0 msat exactly - the pre-fix wrap produced
+ *     amount_msat((u64)-1) garbage and the refusal variant broke those
+ *     shapes outright (#268 strict ladder, 25 refusals).
+ *   MUST-REFUSE (fingerprint): for any nonzero contribution X sat the
+ *     reported field is X*1000 msat, never X (the 1000x under-report).
+ *   MUST-REFUSE (overflow): a contribution whose msat conversion
+ *     overflows peer-fails with "splice funding contribution overflow".
  */
 #include "config.h"
 #include <fcntl.h>
@@ -170,10 +173,30 @@ static void test_must_accept_hsmd_wire_contract(void)
 	tal_free(expected);
 }
 
-/* MUST-REFUSE (i): a negative contribution is refused through the REAL
- * peer_failed chain - forked child must exit with the status-quit bit set
- * (exit(0x80|reason)) and the warning on the peer pipe must name the
- * refusal. */
+/* MUST-ACCEPT (withdrawal clamp): a negative relative is a legitimate
+ * fundee-side withdrawal; the report is exactly 0 msat (the wrap bug's
+ * fingerprint - amount_msat((u64)-x) garbage - must never return). */
+static void test_must_accept_negative_clamps_to_zero(void)
+{
+	static const s64 withdrawals[] = { -1, -100000, -10000000 };
+	struct peer *peer = make_splicing_peer(-1, -1);
+	struct amount_msat res;
+
+	for (size_t i = 0; i < ARRAY_SIZE(withdrawals); i++) {
+		peer->splicing->accepter_relative = withdrawals[i];
+		peer->splicing->opener_relative = withdrawals[i];
+		res = relative_splice_balance_fundee(peer, TX_INITIATOR,
+						    NULL, 0, 0);
+		assert(res.millisatoshis == 0);
+		res = relative_splice_balance_fundee(peer, TX_ACCEPTER,
+						    NULL, 0, 0);
+		assert(res.millisatoshis == 0);
+	}
+}
+
+/* Refusal harness: the REAL peer_failed chain, forked - child must exit
+ * with the status-quit bit set (exit(0x80|reason)) and the warning on
+ * the peer pipe must name the refusal. */
 static void expect_peer_failed(struct peer *peer, enum tx_role role,
 			       const char *expect_substring)
 {
@@ -213,13 +236,7 @@ static void expect_peer_failed(struct peer *peer, enum tx_role role,
 	}
 }
 
-static void test_must_refuse_negative(void)
-{
-	expect_peer_failed(make_splicing_peer(-1, 0), TX_INITIATOR,
-			   "splice funding contribution negative");
-}
-
-/* MUST-REFUSE (ii): the 1000x fingerprint - a nonzero sat contribution
+/* MUST-REFUSE (fingerprint): the 1000x fingerprint - a nonzero sat contribution
  * never surfaces as the same number in msat. */
 static void test_must_refuse_thousand_x_fingerprint(void)
 {
@@ -236,7 +253,7 @@ static void test_must_refuse_thousand_x_fingerprint(void)
 	}
 }
 
-/* MUST-REFUSE (iii): a contribution that cannot convert to msat is
+/* MUST-REFUSE (overflow): a contribution that cannot convert to msat is
  * refused, not truncated. */
 static void test_must_refuse_overflow(void)
 {
@@ -258,7 +275,7 @@ int main(int argc, char *argv[])
 
 	test_must_accept_conversion();
 	test_must_accept_hsmd_wire_contract();
-	test_must_refuse_negative();
+	test_must_accept_negative_clamps_to_zero();
 	test_must_refuse_thousand_x_fingerprint();
 	test_must_refuse_overflow();
 
