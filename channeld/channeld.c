@@ -3598,25 +3598,43 @@ relative_splice_balance_fundee(struct peer *peer,
 			       int chan_output_index UNUSED,
 			       int chan_input_index UNUSED)
 {
-	/* The fundee is the side that did not open the channel.  Select its
-	 * funding contribution by CHANNEL role, not splice role: the splice
-	 * initiator is not necessarily the channel opener (the fundee can
-	 * initiate a splice-in). */
+	/* D1 absolute-balance convention (#268 owner decision 2026-09-30):
+	 * the hsmd setup push_value carries the fundee's TOTAL post-splice
+	 * balance as a plain msat amount - pre-splice owed[] plus the HTLCs
+	 * pending at splice setup attributable to the fundee plus their
+	 * signed relative. The signer (VLS policy-commitment-initial-
+	 * funding-value) trusts this report EXACTLY, so it must cover the
+	 * fundee's balance in every pending-HTLC resolution direction
+	 * (e.g. a fundee-owned HTLC failing back raises the fundee output
+	 * above its at-setup settled balance). A negative TOTAL - settled
+	 * + pending + relative below zero - is a true over-draw and
+	 * peer-fails; nothing is ever wrapped or clamped. */
 	enum side fundee_side = peer->channel->opener == LOCAL ? REMOTE : LOCAL;
 	bool fundee_is_splice_initiator =
 		(fundee_side == LOCAL) == (our_role == TX_INITIATOR);
 	s64 fundee_contribution = fundee_is_splice_initiator
 		? peer->splicing->opener_relative
 		: peer->splicing->accepter_relative;
+	struct htlc_map_iter it;
+	const struct htlc *htlc;
 
-	/* The fundee's pre-splice balance; views agree on owed[].  The
-	 * hsmd setup push_value must carry the fundee's post-splice
-	 * balance.  owed[] is an upper bound of the fundee's output in
-	 * the first post-splice commitment (pending HTLCs only reduce
-	 * it), so it is a safe entitlement floor for a validating
-	 * signer. */
+	/* The fundee's pre-splice settled balance; views agree on owed[]. */
 	struct amount_msat push_value_msat
 		= peer->channel->view[LOCAL].owed[fundee_side];
+
+	/* HTLCs pending at splice setup attributable to the fundee (the
+	 * check_balances pending_htlcs[] shape, selected by htlc_owner
+	 * side instead of splice role). Callers run after check_balances,
+	 * so the view and htlc set are final for this round. */
+	for (htlc = htlc_map_first(peer->channel->htlcs, &it);
+	     htlc;
+	     htlc = htlc_map_next(peer->channel->htlcs, &it)) {
+		if (htlc_owner(htlc) != fundee_side)
+			continue;
+		if (!amount_msat_accumulate(&push_value_msat, htlc->amount))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "Unable to add HTLC balance");
+	}
 
 	/* opener_relative/accepter_relative are SATOSHI funding contributions
 	 * (see their amount_msat_add_sat_s64 callers); the hsmd_setup_channel
@@ -3624,7 +3642,8 @@ relative_splice_balance_fundee(struct peer *peer,
 	 * (or wrapping sats into msat) under-reports the fundee's
 	 * post-splice balance, which a validating signer (VLS strict
 	 * policy-commitment-initial-funding-value) reads as an overpayment and
-	 * refuses - wedging the splice. */
+	 * refuses - wedging the splice.  A negative total or an overflowing
+	 * add is a genuine over-draw, refused the same way. */
 	if (fundee_contribution == INT64_MIN ||
 	    !amount_msat_add_sat_s64(&push_value_msat, push_value_msat,
 				     fundee_contribution))
