@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <hsmd/hsmd_wiregen.h>
+#include <wire/wire.h>
 #include <inttypes.h>
 #include <wire/wire_sync.h>
 
@@ -222,6 +223,27 @@ static void billboard_update(const struct peer *peer)
 					       num_channel_htlcs(peer->channel));
 
 	peer_billboard(false, "%s", update);
+}
+
+
+/* A vls signer refusal is delivered as hsmd msg 115
+ * (HsmdInitReplyFailure: u16 type, u32 error_code, trailing text).
+ * Returns the text, NUL-terminated (best effort: the payload is the
+ * signer's refusal message, not attacker-controlled wire input from a
+ * peer). */
+static const char *hsmd_refusal_text(const tal_t *ctx, const u8 *msg)
+{
+	const u8 *tail;
+	size_t len;
+
+	if (tal_bytelen(msg) < 6)
+		return "(short refusal payload)";
+	tail = msg + 6;
+	len = tal_bytelen(msg) - 6;
+	/* Strip a trailing WireString framing byte-run of non-printables */
+	while (len > 0 && (tail[len-1] < ' ' || tail[len-1] > '~'))
+		len--;
+	return tal_strndup(ctx, (const char *)tail, len);
 }
 
 const u8 *hsm_req(const tal_t *ctx, const u8 *req TAKES)
@@ -2393,10 +2415,22 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	msg2 = hsm_req(tmpctx, take(msg2));
 	struct secret *old_secret;
 	struct pubkey next_point;
-	if (!fromwire_hsmd_validate_commitment_tx_reply(tmpctx, msg2, &old_secret, &next_point))
+	if (!fromwire_hsmd_validate_commitment_tx_reply(tmpctx, msg2, &old_secret, &next_point)) {
+		/* A signer refusal arrives as hsmd msg 115 — a DELIVERED
+		 * answer, not wire corruption.  STATUS_FAIL_HSM_IO here is
+		 * fatal to lightningd (hsmd IO is sacred by design); a
+		 * policy refusal is a channel-level condition: fail the
+		 * channel, keep the node alive.  Live shape: strict
+		 * splice_locked_then_force_close, the late post-payment
+		 * commitment racing the close-start refusal. */
+		if (fromwire_peektype(msg2) == 115)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "hsmd refused validate_commitment_tx: %s",
+				      hsmd_refusal_text(tmpctx, msg2));
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading validate_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg2));
+	}
 
 	struct commitsig *commitsig;
 	commitsig = tal(tmpctx, struct commitsig);
