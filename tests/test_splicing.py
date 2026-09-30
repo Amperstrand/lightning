@@ -879,8 +879,7 @@ def test_splice_locked_then_force_close(node_factory, bitcoind, closer):
 
     l2.daemon.wait_for_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL')
     l1.daemon.wait_for_log(r'CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL')
-    lock_time = bitcoind.rpc.decoderawtransaction(
-        victim.rpc.dev_sign_last_tx(peer.info['id'])['tx'])['txid']
+    lock_time = victim.rpc.dev_sign_last_tx(peer.info['id'], unsigned=True)['txid']
 
     # Any commitment update after the lock revokes the lock-time commitment.
     inv = l2.rpc.invoice(10**7, 'post-lock', 'post-lock')
@@ -888,8 +887,7 @@ def test_splice_locked_then_force_close(node_factory, bitcoind, closer):
     for n in (l1, l2):
         wait_for(lambda: only_one(n.rpc.listpeerchannels()['channels'])['htlcs'] == [])
 
-    current = bitcoind.rpc.decoderawtransaction(
-        victim.rpc.dev_sign_last_tx(peer.info['id'])['tx'])['txid']
+    current = victim.rpc.dev_sign_last_tx(peer.info['id'], unsigned=True)['txid']
 
     # Keep the peer from dropping its own commitment on our error, so ours is
     # the only one that can confirm.
@@ -944,9 +942,9 @@ def test_splice_unconfirmed_force_close_publishes_current(node_factory, bitcoind
 
     # The live commitment spends the original funding; the inflight's spends
     # the (unconfirmed) splice output.
-    current = bitcoind.rpc.decoderawtransaction(
-        l1.rpc.dev_sign_last_tx(l2.info['id'])['tx'])
-    assert only_one(current['vin'])['txid'] == funding_txid
+    current_resp = l1.rpc.dev_sign_last_tx(l2.info['id'], unsigned=True)
+    current = current_resp['txid']
+    assert current_resp['spends_txid'] == funding_txid
     inflight = only_one(only_one(l1.rpc.listpeerchannels()['channels'])['inflight'])
     assert inflight['funding_txid'] == splice_txid
 
@@ -954,7 +952,7 @@ def test_splice_unconfirmed_force_close_publishes_current(node_factory, bitcoind
     l1.daemon.wait_for_log('Peer permanent failure in CHANNELD_AWAITING_SPLICE')
 
     # Both commitments are published, not just the inflight's.
-    l1.daemon.wait_for_logs([r'Broadcasting txid {}'.format(current['txid']),
+    l1.daemon.wait_for_logs([r'Broadcasting txid {}'.format(current),
                              r'Broadcasting txid {}'.format(inflight['scratch_txid'])])
 
 
