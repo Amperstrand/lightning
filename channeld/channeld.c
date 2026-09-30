@@ -3462,53 +3462,38 @@ relative_splice_balance_fundee(struct peer *peer,
 			       int chan_output_index UNUSED,
 			       int chan_input_index UNUSED)
 {
-	/* Relative fundee channel balance */
-	s64 push_value_sat;
-	struct amount_msat push_value_msat;
+	/* The fundee is the side that did not open the channel.  Select its
+	 * funding contribution by CHANNEL role, not splice role: the splice
+	 * initiator is not necessarily the channel opener (the fundee can
+	 * initiate a splice-in). */
+	enum side fundee_side = peer->channel->opener == LOCAL ? REMOTE : LOCAL;
+	bool fundee_is_splice_initiator =
+		(fundee_side == LOCAL) == (our_role == TX_INITIATOR);
+	s64 fundee_contribution = fundee_is_splice_initiator
+		? peer->splicing->opener_relative
+		: peer->splicing->accepter_relative;
 
-	/* We calculcate the `push_value` to send to the
-	 * hsmd, that is the remote amount in the channel
-	 * after the splice. */
-	switch (our_role) {
-	case TX_INITIATOR:
-		/* push_value is the fundee relative value so if we open the channel
-		 * fundee is the remote node. */
-		push_value_sat = peer->splicing->accepter_relative;
-		break;
-	case TX_ACCEPTER:
-		/* push_value is the fundee relative value so if the remote node open the channel
-		 * fundee in this case is the opener. */
-		push_value_sat = peer->splicing->opener_relative;
-		break;
-	default:
-		/* This should never happen. Help us to early catch the tx_role change */
-		abort();
-	}
+	/* The fundee's pre-splice balance; views agree on owed[].  The
+	 * hsmd setup push_value must carry the fundee's post-splice
+	 * balance.  owed[] is an upper bound of the fundee's output in
+	 * the first post-splice commitment (pending HTLCs only reduce
+	 * it), so it is a safe entitlement floor for a validating
+	 * signer. */
+	struct amount_msat push_value_msat
+		= peer->channel->view[LOCAL].owed[fundee_side];
 
 	/* opener_relative/accepter_relative are SATOSHI funding contributions
-	 * (see their amount_msat_add_sat_s64 callers); the hsmd setup field is
-	 * amount_msat. Wrapping the raw value under-reported the fundee's
-	 * post-splice balance by 1000x, which a validating signer (VLS strict
+	 * (see their amount_msat_add_sat_s64 callers); the hsmd_setup_channel
+	 * push_value field is amount_msat.  Reporting only the contribution
+	 * (or wrapping sats into msat) under-reports the fundee's
+	 * post-splice balance, which a validating signer (VLS strict
 	 * policy-commitment-initial-funding-value) reads as an overpayment and
 	 * refuses - wedging the splice. */
-	if (push_value_sat < 0) {
-		/* A negative relative is a legitimate fundee-side withdrawal
-		 * (RBF rounds that reduce a side, splice-outs) - the fundee's
-		 * post-splice entitlement is carried - |r|. The unsigned push
-		 * field cannot carry the reduction, so we clamp to 0: the
-		 * signer's allowance stays push + carried = carried, which the
-		 * honest first new-era commitment (paying carried - |r|) never
-		 * exceeds. Bounded residual: the initial-commitment allowance
-		 * over-states by |r| until the era's commitment chain takes
-		 * over; exact precision needs a signer-side signed-relative
-		 * convention (owner-gated, lightning-playground #268). */
-		push_value_msat = AMOUNT_MSAT(0);
-		return push_value_msat;
-	}
-	if (!amount_sat_to_msat(&push_value_msat,
-				amount_sat(push_value_sat)))
+	if (fundee_contribution == INT64_MIN ||
+	    !amount_msat_add_sat_s64(&push_value_msat, push_value_msat,
+				     fundee_contribution))
 		peer_failed_warn(peer->pps, &peer->channel_id,
-				 "splice funding contribution overflow");
+				 "splice funding contribution out of range for fundee balance");
 
 	return push_value_msat;
 }
