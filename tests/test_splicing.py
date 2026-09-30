@@ -696,6 +696,13 @@ def test_route_by_old_scid(node_factory, bitcoind):
     wait_for(lambda: only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['state'] == 'CHANNELD_NORMAL')
 
     # Now l1 tries to send using old scid: should work
+    # Strict-signer note (lightning-playground #268 EC-6 adjudication):
+    # raw sendpay never consults preapproval, so a validating signer sees
+    # an uninvoiced source payment and must refuse it. The production
+    # payer path (the pay plugin) pre-approves the invoice first; do the
+    # same here so the hand-built old-scid route is the ONLY unusual
+    # thing about this payment.
+    l1.rpc.preapproveinvoice(inv['bolt11'])
     l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(inv['payment_hash'])
 
@@ -721,6 +728,8 @@ def test_route_by_old_scid(node_factory, bitcoind):
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
 
     wait_for(lambda: only_one(l1.rpc.listpeers()['peers'])['connected'] is True)
+    # Same strict-signer registration as above (#268 EC-6).
+    l1.rpc.preapproveinvoice(inv2['bolt11'])
     l1.rpc.sendpay(route, inv2['payment_hash'], payment_secret=inv2['payment_secret'])
     l1.rpc.waitsendpay(inv2['payment_hash'])
 
