@@ -63,7 +63,6 @@ This point release is recommended for all users.
    before any subdaemon can attach, so the funding spend watch takes the channel
    onchain instead of the node asking its signer for new commitments against a
    spent funding output.
->>>>>>> 459c4cecb (lightningd: reconcile spent-funding channels at startup before subdaemon attach)
 
 ## [26.06.8] - 2026-09-19: "Quantum-Resistant Lightning Channel V"
 
