@@ -2602,6 +2602,12 @@ static struct command_result *json_stfu_channels(struct command *cmd,
 			 NULL))
 		return command_param_failed();
 
+	/* The bare call (no channel_ids array at all) must fail cleanly,
+	 * not walk a NULL token. */
+	if (!channel_ids_tok)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Must specify a channel");
+
 	channels = tal_arr(cmd, struct channel*, 0);
 	json_for_each_arr(i, channel_id_tok, channel_ids_tok) {
 		result = param_channel_for_splice(cmd, NULL, buffer, channel_id_tok,
@@ -2669,6 +2675,12 @@ static struct command_result *json_abort_channels(struct command *cmd,
 			 p_opt("channel_ids", param_array, &channel_ids_tok),
 			 NULL))
 		return command_param_failed();
+
+	/* The bare call (no channel_ids array at all) must fail cleanly,
+	 * not walk a NULL token. */
+	if (!channel_ids_tok)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Must specify a channel");
 
 	channels = tal_arr(cmd, struct channel*, 0);
 	json_for_each_arr(i, channel_id_tok, channel_ids_tok) {
