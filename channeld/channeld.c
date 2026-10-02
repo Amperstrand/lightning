@@ -5831,7 +5831,23 @@ static void peer_reconnect(struct peer *peer,
 					    inflight->psbt)) {
 			status_info("Unable to resume splice as user sig(s)"
 				    " are missing.");
-			inflight = NULL;
+			/* The splice can never be completed: our user's
+			 * wallet signatures are missing and only our side
+			 * can provide them.  Tell master to drop it so the
+			 * channel continues on the original funding,
+			 * instead of leaving a ghost inflight that kills
+			 * the first subdaemon that trips over it. */
+			wire_sync_write(MASTER_FD,
+					take(towire_channeld_splice_abort(
+						NULL, true,
+						&inflight->outpoint,
+						"user signatures missing;"
+						" splice uncompletable")));
+			/* Give master a chance to pass the fd along */
+			status_info("Delaying closing of master fd by 1 second");
+			sleep(1);
+			close(MASTER_FD);
+			exit(0);
 		} else {
 			status_info("Reconnecting to peer with pending inflight"
 				    " commit: %s, remote sigs: %s.",
@@ -6042,6 +6058,31 @@ static void peer_reconnect(struct peer *peer,
 	/* DTODO: Update splice BOLT spec PR and reference here. */
 	if (inflight && (remote_next_funding || local_next_funding)) {
 		if (!remote_next_funding) {
+			/* Only the initiator drives a splice to completion.
+			 * If we hold an inflight as the ACCEPTER and their
+			 * reestablish omitted next_funding, the initiator
+			 * has no live splice: resuming would wait forever
+			 * for messages that will never come, wedging the
+			 * channel in CHANNELD_AWAITING_SPLICE with an
+			 * inflight that can never confirm.  Drop it and
+			 * keep the channel instead. */
+			if (!inflight->i_am_initiator) {
+				status_info("Peer omitted next_funding and we"
+					    " are the splice accepter: peer has"
+					    " no live splice, aborting ours");
+				wire_sync_write(MASTER_FD,
+						take(towire_channeld_splice_abort(
+							NULL, true,
+							&inflight->outpoint,
+							"peer omitted"
+							" next_funding")));
+				/* Give master a chance to pass the fd along */
+				status_info("Delaying closing of master fd"
+					    " by 1 second");
+				sleep(1);
+				close(MASTER_FD);
+				exit(0);
+			}
 			status_info("Resuming splice negotation.");
 			resume_splice_negotiation(peer,
 						  false,

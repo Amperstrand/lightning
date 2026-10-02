@@ -375,6 +375,13 @@ static void handle_splice_abort(struct lightningd *ld,
 		log_peer_unusual(ld->log, &peer->id, "Splice aborted"
 				 " %s", reason);
 
+	/* With every inflight dropped the channel continues on the
+	 * original funding: the splice-wait state is over. */
+	if (channel->state == CHANNELD_AWAITING_SPLICE)
+		channel_set_state(channel, CHANNELD_AWAITING_SPLICE,
+				  CHANNELD_NORMAL, REASON_LOCAL,
+				  "splice aborted");
+
 	log_debug(channel->log,
 		  "Restarting channeld after tx_abort on %s channel",
 		  channel_state_name(channel));
