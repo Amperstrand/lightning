@@ -245,6 +245,41 @@ remember_channel_utxos(struct command *cmd,
 	return send_outreq(req);
 }
 
+/* A signer refusal arriving through signpsbt (e.g. VLS strict policy on
+ * dual-funding shapes: the sign_withdrawal reply carries the refusal
+ * text, signpsbt fails cleanly at the RPC layer) is a delivered answer
+ * about THIS OPEN, not a plugin-contract violation: forward_error here
+ * would answer the openchannel2_sign HOOK with an error object, which
+ * lightningd treats as fatal (plugin_hook.c: "returned non-result
+ * response") — killing the node and hanging the suite (#270 coverage
+ * run, test_funder_contribution_limits). Instead: log the refusal
+ * loudly, drop the pending open, and answer the hook with a
+ * non-"continue" result so dualopend fails the open cleanly
+ * (hook_extract_psbt's abort path sends dualopend_fail). */
+static struct command_result *
+signpsbt_open_fail(struct command *cmd,
+		   const char *method,
+		   const char *buf,
+		   const jsmntok_t *error,
+		   struct pending_open *open)
+{
+	struct json_stream *response;
+
+	plugin_log(cmd->plugin, LOG_BROKEN,
+		   "`signpsbt` failed for channel %s: %.*s -- failing the open"
+		   " (signer refusal is a delivered answer)",
+		   fmt_channel_id(tmpctx, &open->channel_id),
+		   json_tok_full_len(error),
+		   json_tok_full(buf, error));
+
+	list_del_from(&pending_opens, &open->list);
+	tal_free(open);
+
+	response = jsonrpc_stream_success(cmd);
+	json_add_string(response, "result", "fail");
+	return command_finished(cmd, response);
+}
+
 static struct command_result *
 signpsbt_done(struct command *cmd,
 	      const char *method,
@@ -328,7 +363,7 @@ json_openchannel2_sign_call(struct command *cmd,
 	req = jsonrpc_request_start(cmd,
 				    "signpsbt",
 				    &signpsbt_done,
-				    &forward_error,
+				    &signpsbt_open_fail,
 				    open);
 	json_add_psbt(req->js, "psbt", psbt);
 	/* Use input markers to identify which inputs
