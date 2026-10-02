@@ -607,6 +607,55 @@ static struct command_result *json_peer_sigs(struct command *cmd,
 	return notification_handled(cmd);
 }
 
+/* Fork #270: lightningd emits channel_open_failed when an open aborts
+ * — including a strict-signer refusal delivered through the
+ * openchannel2_sign hook (the fundee's signer refuses, the open fails
+ * cleanly on both daemons, this notification fires). Without this
+ * watcher the mfc destination sits in SECURED forever waiting for
+ * peer_sigs that will never come, and the driving fundchannel command
+ * hangs the whole suite. */
+static struct command_result *
+json_channel_open_failed(struct command *cmd,
+			 const char *buf,
+			 const jsmntok_t *params)
+{
+	struct channel_id cid;
+	struct multifundchannel_destination *dest;
+	const char *err;
+
+	err = json_scan(tmpctx, buf, params,
+			"{channel_open_failed:"
+			"{channel_id:%}}",
+			JSON_SCAN(json_to_channel_id, &cid));
+	if (err)
+		plugin_err(cmd->plugin,
+			   "`channel_open_failed` did not scan: %s. %.*s",
+			   err, json_tok_full_len(params),
+			   json_tok_full(buf, params));
+
+	dest = find_dest_by_channel_id(&cid);
+	if (!dest) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "mfc ??: `channel_open_failed` no pending dest"
+			   " found for channel_id %s",
+			   fmt_channel_id(tmpctx, &cid));
+		return notification_handled(cmd);
+	}
+
+	plugin_log(cmd->plugin, LOG_DBG,
+		   "mfc %"PRIu64": `channel_open_failed` notice received"
+		   " for channel %s",
+		   dest->mfc->id,
+		   fmt_channel_id(tmpctx, &cid));
+
+	if (dest->state != MULTIFUNDCHANNEL_FAILED)
+		fail_destination_msg(dest, LIGHTNINGD,
+				     "channel open failed");
+	check_sigs_ready(dest->mfc);
+
+	return notification_handled(cmd);
+}
+
 /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*
  * The v2 of channel establishment uses a different RPC flow:
  * `openchannel_init`, `openchannel_update`, && `openchannel_signed`
@@ -1134,6 +1183,10 @@ const struct plugin_notification openchannel_notifs[] = {
 	{
 		"openchannel_peer_sigs",
 		json_peer_sigs,
+	},
+	{
+		"channel_open_failed",
+		json_channel_open_failed,
 	}
 };
 const size_t num_openchannel_notifs = ARRAY_SIZE(openchannel_notifs);
