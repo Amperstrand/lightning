@@ -675,6 +675,9 @@ void topology_add_sync_waiter_(const tal_t *ctx UNNEEDED,
 					  void *) UNNEEDED,
 			       void *arg UNNEEDED)
 { fprintf(stderr, "topology_add_sync_waiter_ called!\n"); abort(); }
+/* Generated stub for towire_channeld_abort */
+u8 *towire_channeld_abort(const tal_t *ctx UNNEEDED)
+{ fprintf(stderr, "towire_channeld_abort called!\n"); abort(); }
 /* Generated stub for towire_channeld_dev_memleak */
 u8 *towire_channeld_dev_memleak(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_channeld_dev_memleak called!\n"); abort(); }
