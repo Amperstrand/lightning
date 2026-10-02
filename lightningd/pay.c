@@ -10,6 +10,8 @@
 #include <common/onionreply.h>
 #include <common/route.h>
 #include <common/timeout.h>
+#include <lightningd/hsm_control.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/channel.h>
 #include <lightningd/invoice.h>
 #include <lightningd/notification.h>
@@ -1648,6 +1650,41 @@ static struct command_result *json_sendpay(struct command *cmd,
 
 	if (command_check_only(cmd))
 		return command_check_done(cmd);
+
+	/* lightning-playground #270: a raw sendpay never consulted
+	 * preapproval, so a validating signer sees the outgoing HTLC as
+	 * unregistered (max_to_invoice_msat 0) and correctly refuses the
+	 * commitment (validate_payments: 0 + 0 < outgoing). When the caller
+	 * supplies the invoice, register it through the production
+	 * preapproval channel first — the same round-trip the
+	 * preapproveinvoice RPC makes. Stock hsmd approves unconditionally:
+	 * no behavior change there. */
+	if (invstring) {
+		u8 *req;
+		const u8 *msg;
+		bool approved;
+
+		if (!hsm_capable(cmd->ld, WIRE_HSMD_PREAPPROVE_INVOICE_CHECK))
+			req = towire_hsmd_preapprove_invoice(NULL, invstring);
+		else
+			req = towire_hsmd_preapprove_invoice_check(NULL, invstring,
+								   false);
+
+		msg = hsm_sync_req(tmpctx, cmd->ld, take(req));
+
+		if (!fromwire_hsmd_preapprove_invoice_reply(msg, &approved)
+		    && !fromwire_hsmd_preapprove_invoice_check_reply(msg,
+								    &approved)) {
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "HSM gave bad preapprove_invoice_reply %s",
+					    tal_hex(msg, msg));
+		}
+
+		if (!approved)
+			return command_fail(cmd,
+					    PAY_INVOICE_PREAPPROVAL_DECLINED,
+					    "invoice was declined");
+	}
 
 	return send_payment(cmd->ld, cmd, rhash, *partid, *group,
 			    route,
