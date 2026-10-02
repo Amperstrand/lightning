@@ -834,6 +834,17 @@ static struct command_result *json_signpsbt(struct command *cmd,
 					    i, input_nums[i]);
 	}
 
+	/* A PSBT with no outputs would destroy every input to fees if
+	 * signed and broadcast.  Refuse it with a typed error rather
+	 * than letting hsmd abort the node (utxopsbt satoshi=all, for
+	 * example, discards excess_as_change and produces exactly this
+	 * shape). */
+	if (psbt->num_outputs == 0)
+		return command_fail(cmd, LIGHTNINGD,
+				    "PSBT has no outputs: signing it would"
+				    " destroy its inputs to fees. Add an"
+				    " output (e.g. a change output) first.");
+
 	/* We have to find/locate the utxos that are ours on this PSBT,
 	 * so that the HSM knows how/what to sign for (it's possible some of
 	 * our utxos require more complicated data to sign for e.g.
