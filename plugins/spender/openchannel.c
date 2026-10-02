@@ -592,7 +592,7 @@ static struct command_result *json_peer_sigs(struct command *cmd,
 	return notification_handled(cmd);
 }
 
-/* Fork #270: lightningd emits channel_open_failed when an open aborts
+/* lightningd emits channel_open_failed when an open aborts
  * — including a strict-signer refusal delivered through the
  * openchannel2_sign hook (the fundee's signer refuses, the open fails
  * cleanly on both daemons, this notification fires). Without this
