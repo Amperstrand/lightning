@@ -1414,6 +1414,15 @@ class LightningNode(object):
         invoices = dst.rpc.listinvoices(label)['invoices']
         assert len(invoices) == 1 and invoices[0]['status'] == 'unpaid'
 
+        # Strict-signer note (lightning-playground #270 cascade map, the
+        # #268 EC-6 pattern proven in 8ac2a609a): this helper pays via raw
+        # sendpay, which never consults preapproval on its own -- a
+        # validating signer sees an outgoing HTLC with no registered
+        # invoice (max_to_invoice_msat 0) and correctly refuses it,
+        # killing the channel mid-test. Register the invoice on the payer
+        # through the production preapproval channel first.
+        self.rpc.preapproveinvoice(inv['bolt11'])
+
         # Pick first normal channel.
         scid = [c['short_channel_id'] for c in self.rpc.listpeerchannels(dst_id)['channels']
                 if c['state'] == 'CHANNELD_NORMAL'][0]
