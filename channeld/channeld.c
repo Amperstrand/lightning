@@ -5798,7 +5798,7 @@ static void peer_reconnect(struct peer *peer,
 	struct secret last_local_per_commitment_secret;
 	bool dataloss_protect, check_extra_fields;
 	const u8 **premature_msgs = tal_arr(peer, const u8 *, 0);
-	struct inflight *inflight;
+	struct inflight *inflight, *forgotten_inflight = NULL;
 	struct tlv_channel_reestablish_tlvs_next_funding *local_next_funding,
 							 *remote_next_funding;
 	u64 send_next_commitment_number;
@@ -5833,21 +5833,13 @@ static void peer_reconnect(struct peer *peer,
 				    " are missing.");
 			/* The splice can never be completed: our user's
 			 * wallet signatures are missing and only our side
-			 * can provide them.  Tell master to drop it so the
-			 * channel continues on the original funding,
-			 * instead of leaving a ghost inflight that kills
-			 * the first subdaemon that trips over it. */
-			wire_sync_write(MASTER_FD,
-					take(towire_channeld_splice_abort(
-						NULL, true,
-						&inflight->outpoint,
-						"user signatures missing;"
-						" splice uncompletable")));
-			/* Give master a chance to pass the fd along */
-			status_info("Delaying closing of master fd by 1 second");
-			sleep(1);
-			close(MASTER_FD);
-			exit(0);
+			 * can provide them.  Finish the reestablish
+			 * handshake first (so the peer sees our omitted
+			 * next_funding and can act on it), then tell
+			 * master to drop the ghost before it kills the
+			 * first subdaemon to trip over it. */
+			forgotten_inflight = inflight;
+			inflight = NULL;
 		} else {
 			status_info("Reconnecting to peer with pending inflight"
 				    " commit: %s, remote sigs: %s.",
@@ -6132,17 +6124,28 @@ static void peer_reconnect(struct peer *peer,
 							 &inflight->outpoint.txid));
 		}
 	} else if (remote_next_funding) { /* No current inflight */
-		/* If our peer is trying to negotiate details about a splice
-		 * that is already onchain, jump ahead to sending splice_lock */
-		if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
-				    &peer->channel->funding.txid))
+		/* The peer still references the splice we just dropped
+		 * (they constructed their reestablish before seeing our
+		 * omission): expected during mutual abandonment, not an
+		 * error.  The deferred cleanup below informs master. */
+		if (forgotten_inflight
+		    && bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
+				       &forgotten_inflight->outpoint.txid)) {
+			status_info("Peer still references the splice we"
+				    " dropped; expecting them to drop it"
+				    " too.");
+		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
+				    &peer->channel->funding.txid)) {
+			/* If our peer is trying to negotiate details about a splice
+			 * that is already onchain, jump ahead to sending splice_lock */
 			status_info("We have no pending splice but peer"
 				    " is negotiating one that matches current"
 				    " channel, ignoring it: %s",
 				    fmt_bitcoin_outpoint(tmpctx, &peer->channel->funding));
-		else
+		} else {
 			splice_abort(peer, NULL,
 				     "next_funding_txid not recognized.");
+		}
 	}
 
 	/* "none of those channel_reestablish messages contain
@@ -6387,6 +6390,26 @@ static void peer_reconnect(struct peer *peer,
 	/* We allow peer to send us tx-sigs, until funding locked received */
 	peer->tx_sigs_allowed = true;
 	peer_billboard(true, "Reconnected, and reestablished.");
+
+	/* Deferred from the reestablish construction: this splice can
+	 * never be completed (our user's wallet signatures are missing
+	 * and only our side can provide them).  The handshake is done,
+	 * so the peer has seen our omitted next_funding and had its
+	 * chance to act on it: now tell master to drop the ghost inflight
+	 * before it kills the first subdaemon to trip over it. */
+	if (forgotten_inflight) {
+		wire_sync_write(MASTER_FD,
+				take(towire_channeld_splice_abort(
+					NULL, true,
+					&forgotten_inflight->outpoint,
+					"user signatures missing;"
+					" splice uncompletable")));
+		/* Give master a chance to pass the fd along */
+		status_info("Delaying closing of master fd by 1 second");
+		sleep(1);
+		close(MASTER_FD);
+		exit(0);
+	}
 
 	/* BOLT #2:
 	 *   - upon reconnection:
