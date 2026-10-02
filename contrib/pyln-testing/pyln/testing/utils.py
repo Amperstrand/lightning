@@ -21,7 +21,9 @@ import logging
 import lzma
 import math
 import mnemonic
+import glob
 import os
+import sysconfig
 import random
 import re
 import shutil
@@ -871,6 +873,37 @@ class LightningD(TailableProc):
 
         self.rpcproxy = bitcoindproxy
         self.env['CLN_PLUGIN_LOG'] = "cln_plugin=trace,cln_rpc=trace,cln_grpc=trace,debug"
+
+        # Plugins with a `#!/usr/bin/env python3` shebang (e.g.
+        # tests/plugins/coin_movements.py importing pyln.client) resolve
+        # against the SYSTEM python, not the venv running pytest -- a
+        # ModuleNotFoundError at getmanifest and a dead plugin. Put this
+        # tree's pyln packages on the daemon env's PYTHONPATH so plugin
+        # subprocesses import the same pyln the tests do. Harmless (path
+        # duplication) when pyln is installed system-wide.
+        _tree_root = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(6):
+            if os.path.isdir(os.path.join(_tree_root, 'contrib', 'pyln-testing')):
+                break
+            _tree_root = os.path.dirname(_tree_root)
+        _pyln_paths = [
+            os.path.join(_tree_root, 'contrib', 'pyln-testing'),
+            os.path.join(_tree_root, 'contrib', 'pyln-client'),
+            os.path.join(_tree_root, 'contrib', 'pyln-proto'),
+            os.path.join(_tree_root, 'contrib', 'pyln-grpc-proto'),
+        ] + sorted(glob.glob(os.path.join(
+            _tree_root, 'contrib', 'pyln-spec', 'bolt*')))
+        # Third-party deps of those packages (e.g. PySocks for
+        # pyln.proto) live in the RUNNING interpreter's site-packages
+        # (the venv under a harness) -- the daemon env does not inherit
+        # it, so append it after the tree paths.
+        _purelib = sysconfig.get_paths()['purelib']
+        if os.path.isdir(_purelib):
+            _pyln_paths.append(_purelib)
+
+        self.env['PYTHONPATH'] = os.pathsep.join(
+            _pyln_paths + ([self.env['PYTHONPATH']]
+                           if 'PYTHONPATH' in self.env else []))
 
         self.opts = LIGHTNINGD_CONFIG.copy()
 
