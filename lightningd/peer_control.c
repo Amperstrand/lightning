@@ -2824,12 +2824,6 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 	if (!dead)
 		return KEEP_WATCHING;
 
-	log_unusual(channel->log,
-		    "Splice inflight input %s was spent by conflicting"
-		    " transaction %s: aborting splice",
-		    fmt_bitcoin_outpoint(tmpctx, &outpoint),
-		    fmt_bitcoin_txid(tmpctx, &txid));
-
 	if (!channel->owner) {
 		/* Startup catch-up: no channeld to abort.  Drop the dead
 		 * inflight(s) now so the channel starts clean on the
@@ -2865,12 +2859,27 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 			channel_set_state(channel, CHANNELD_AWAITING_SPLICE,
 					  CHANNELD_NORMAL, REASON_LOCAL,
 					  "splice inflight inputs double-spent");
+		log_unusual(channel->log,
+			    "Splice inflight input %s was spent by conflicting"
+			    " transaction %s: dropped dead inflight(s) at"
+			    " startup",
+			    fmt_bitcoin_outpoint(tmpctx, &outpoint),
+			    fmt_bitcoin_txid(tmpctx, &txid));
 		return DELETE_WATCH;
 	}
 
-	if (!channel_state_closing(channel->state))
-		subd_send_msg(channel->owner,
-			      take(towire_channeld_abort(NULL)));
+	/* A close already in flight spends the funding input too: the
+	 * splice is moot, nothing to abort. */
+	if (channel_state_closing(channel->state))
+		return DELETE_WATCH;
+
+	log_unusual(channel->log,
+		    "Splice inflight input %s was spent by conflicting"
+		    " transaction %s: aborting splice",
+		    fmt_bitcoin_outpoint(tmpctx, &outpoint),
+		    fmt_bitcoin_txid(tmpctx, &txid));
+	subd_send_msg(channel->owner,
+		      take(towire_channeld_abort(NULL)));
 
 	return DELETE_WATCH;
 }
