@@ -4306,6 +4306,11 @@ static void forget_channel_open(struct channel *channel, const char *why)
 		return;
 
 	log_info(channel->log, "%s. Deleting channel.", why);
+	/* Fork #270: on the sign-hook abort path open_attempt is already
+	 * freed, so channel_cleanup_commands' notify (gated on it) never
+	 * fires — emit here so listeners (spenderp's multifundchannel)
+	 * fail the driving command instead of waiting on a dead open. */
+	notify_channel_open_failed(channel->peer->ld, &channel->cid);
 	delete_channel(channel, false);
 }
 
