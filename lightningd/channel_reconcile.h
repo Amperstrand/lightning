@@ -17,4 +17,8 @@ void channel_reconcile_funding(struct lightningd *ld);
  * the spend confirms; a chainview recovery clears this). */
 bool channel_funding_spend_unresolved(const struct channel *channel);
 
+/* Called from notify_new_block() on every new block: recheck channels
+ * still deferring on a spent report (mempool case). */
+void channel_reconcile_notify_new_block(struct lightningd *ld);
+
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_RECONCILE_H */

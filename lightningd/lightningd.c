@@ -769,6 +769,7 @@ void notify_new_block(struct lightningd *ld)
 	/* Inform our subcomponents individually. */
 	htlcs_notify_new_block(ld);
 	channel_notify_new_block(ld);
+	channel_reconcile_notify_new_block(ld);
 	channel_gossip_notify_new_block(ld);
 	gossip_notify_new_block(ld);
 	waitblockheight_notify_new_block(ld);
