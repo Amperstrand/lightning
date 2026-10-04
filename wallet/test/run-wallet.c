@@ -100,6 +100,9 @@ u64 chain_mvt_index_created(struct lightningd *ld UNNEEDED,
 			    struct amount_msat credit UNNEEDED,
 			    struct amount_msat debit UNNEEDED)
 { fprintf(stderr, "chain_mvt_index_created called!\n"); abort(); }
+/* Generated stub for channel_funding_spend_unresolved */
+bool channel_funding_spend_unresolved(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_funding_spend_unresolved called!\n"); abort(); }
 /* Generated stub for channel_mvt_index_created */
 u64 channel_mvt_index_created(struct lightningd *ld UNNEEDED,
 			      struct db *db UNNEEDED,

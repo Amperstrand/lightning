@@ -21,6 +21,7 @@
 #include <lightningd/anchorspend.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
+#include <lightningd/channel_reconcile.h>
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closed_channel.h>
 #include <lightningd/closing_control.h>
@@ -1423,8 +1424,8 @@ peer_connected_serialize(struct peer_connected_hook_payload *payload,
 	json_object_end(stream); /* .peer */
 }
 
-static bool ignore_idle_channel(const struct lightningd *ld,
-				const struct channel *channel)
+bool ignore_idle_channel(const struct lightningd *ld,
+			 const struct channel *channel)
 {
 	return ld->state == LD_STATE_GRACE
 		&& !channel_has_htlc_out(channel)
@@ -1441,6 +1442,17 @@ static void connect_activate_subd(struct lightningd *ld, struct channel *channel
 	/* If we have a canned error for this channel, send it now */
 	if (channel->error) {
 		error = channel->error;
+		goto send_error;
+	}
+
+	/* Startup reconciliation says the funding output is already spent:
+	 * never resume a dead channel.  The funding spend watch will move
+	 * it onchain once the spend confirms (or a chainview recovery
+	 * clears the gate and we reconnect). */
+	if (channel_funding_spend_unresolved(channel)) {
+		error = towire_errorfmt(tmpctx, &channel->cid,
+					"Funding transaction spent: "
+					"awaiting onchain resolution");
 		goto send_error;
 	}
 
@@ -2155,6 +2167,17 @@ void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 		/* If we have a canned error for this channel, send it now */
 		if (channel->error) {
 			error = channel->error;
+			goto send_error;
+		}
+
+		/* Funding already spent per startup reconciliation: never
+		 * resume this channel (channeld reestablish negotiation or
+		 * dualopend restart included); the funding spend watch is
+		 * taking it onchain. */
+		if (channel_funding_spend_unresolved(channel)) {
+			error = towire_errorfmt(tmpctx, &channel_id,
+						"Funding transaction spent: "
+						"awaiting onchain resolution");
 			goto send_error;
 		}
 
@@ -3137,7 +3160,8 @@ static void setup_peer(struct peer *peer)
 		    && !(channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL))
 			continue;
 
-		if (channel_state_wants_peercomms(channel->state)
+		if (!channel_funding_spend_unresolved(channel)
+		    && channel_state_wants_peercomms(channel->state)
 		    && !ignore_idle_channel(ld, channel))
 			connect = true;
 		if (channel_important_filter(channel, NULL))

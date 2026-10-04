@@ -53,6 +53,17 @@ This point release is recommended for all users.
  - 'checkrune': 'method/createrune' and 'method/blacklistrune' restrictions can no longer be bypassed with the 'invokerune'/'destroyrune' aliases
  - runes: a rune with restrictions can no longer relist blacklisted runes.
  - runes: a rune with restrictions can no longer create a new rune without them.
+## [Unreleased]
+
+### Fixed
+
+ - lightningd: on restart, a channel whose funding output was already spent (onchain
+   or in the mempool) while still in a live DB state no longer has channeld
+   reattached to it: startup now reconciles the funding outpoint against bitcoind
+   before any subdaemon can attach, so the funding spend watch takes the channel
+   onchain instead of the node asking its signer for new commitments against a
+   spent funding output.
+>>>>>>> 459c4cecb (lightningd: reconcile spent-funding channels at startup before subdaemon attach)
 
 ## [26.06.8] - 2026-09-19: "Quantum-Resistant Lightning Channel V"
 
