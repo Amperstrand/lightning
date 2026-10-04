@@ -720,9 +720,18 @@ static enum watch_result splice_depth_cb(struct lightningd *ld,
 			  fmt_short_channel_id(tmpctx, *inflight->scid));
 		subd_send_msg(inflight->channel->owner,
 			      take(towire_channeld_funding_depth(
-					   NULL, inflight->scid,
-					   depth, true,
-					   &inflight->funding->outpoint.txid)));
+				   NULL, inflight->scid,
+				   depth, true,
+				   &inflight->funding->outpoint.txid)));
+	} else {
+		/* Dropped, not deferred: the freshly attached channeld
+		 * gets the real depth replayed at startup instead. */
+		log_debug(inflight->channel->log,
+			  "splice_depth_cb: no owner, dropping depth %u"
+			  " for txid %s",
+			  depth,
+			  fmt_bitcoin_txid(tmpctx,
+					   &inflight->funding->outpoint.txid));
 	}
 
 	/* channeld will tell us when splice is locked in: we'll clean
@@ -2036,6 +2045,31 @@ bool peer_start_channeld(struct channel *channel,
 		      take(towire_channeld_funding_depth(
 			   NULL, channel->scid, 0, false,
 			   &txid)));
+
+	/* Replay the confirmed depth of any splice inflights.  Depth
+	 * notifications that fired while the channel had no owner
+	 * (blocks processed during startup catch-up, before channeld
+	 * attached) were dropped: without this replay the freshly
+	 * attached channeld parks in CHANNELD_AWAITING_SPLICE until an
+	 * arbitrary next block re-fires the depth watch. */
+	list_for_each(&channel->inflights, inflight, list) {
+		u32 splice_depth;
+
+		if (!inflight->scid)
+			continue;
+		splice_depth = get_block_height(ld->topology)
+			- short_channel_id_blocknum(*inflight->scid);
+		log_debug(channel->log,
+			  "Replaying confirmed splice depth %u for txid %s",
+			  splice_depth,
+			  fmt_bitcoin_txid(tmpctx,
+					   &inflight->funding->outpoint.txid));
+		subd_send_msg(channel->owner,
+			      take(towire_channeld_funding_depth(
+				   NULL, inflight->scid, splice_depth,
+				   true,
+				   &inflight->funding->outpoint.txid)));
+	}
 	return true;
 }
 
