@@ -39,11 +39,12 @@
  *    mempool): RAIL DECISION - the channel takes
  *    AWAITING_UNILATERAL-style semantics: we do not attach, and no new
  *    commitment is ever requested, until either the spend confirms (the
- *    watch fires and onchaind takes over) or a later check finds the
- *    output unspent again (mempool eviction / reorg), at which point
- *    normal attachment resumes.  This is deliberately conservative in
- *    the direction of never asking the signer to commit against a
- *    funding output the chain says is gone.
+ *    watch fires and onchaind takes over) or the per-new-block recheck
+ *    (channel_reconcile_notify_new_block) finds the output unspent
+ *    again (mempool eviction / reorg), at which point normal attachment
+ *    resumes.  This is deliberately conservative in the direction of
+ *    never asking the signer to commit against a funding output the
+ *    chain says is gone.
  *
  * Channels whose funding we never saw confirmed (zeroconf stubs, v2
  * opening candidates) are not gated: for them a missing getutxout entry
@@ -145,16 +146,30 @@ static void recheck_utxo_cb(struct bitcoind *bitcoind UNUSED,
 {
 	struct lightningd *ld = channel->peer->ld;
 
-	if (!txout || !channel->funding_spent_unresolved)
+	if (!channel->funding_spent_unresolved)
 		return;
 
-	/* Spent report overturned (mempool eviction, reorg): clear the
-	 * deferral and let the normal connect machinery resume. */
+	if (!txout
+	    && wallet_transaction_height(ld->wallet,
+					 &channel->funding.txid) != 0) {
+		/* Still spent per the chainview, and the funding itself is
+		 * still confirmed: keep deferring (spend confirmed or in
+		 * mempool). */
+		return;
+	}
+
+	/* Either the output is unspent again (mempool eviction, reorg) or
+	 * the funding transaction itself is no longer confirmed (reorged
+	 * out: no spend of it can be visible while it is absent from the
+	 * chainview).  Both restore normal operation; if a spend
+	 * reappears, the funding spend watch (or the next boot's gate)
+	 * handles it. */
 	channel->funding_spent_unresolved = false;
 	log_unusual(channel->log,
-		    "Funding output %s is unspent again: resuming normal "
+		    "Funding output %s is %s: resuming normal "
 		    "channel operation",
-		    fmt_bitcoin_outpoint(tmpctx, &channel->funding));
+		    fmt_bitcoin_outpoint(tmpctx, &channel->funding),
+		    txout ? "unspent again" : "no longer confirmed");
 
 	if (ld->reconnect
 	    && channel_state_wants_peercomms(channel->state)
@@ -165,12 +180,13 @@ static void recheck_utxo_cb(struct bitcoind *bitcoind UNUSED,
 	}
 }
 
-/* Called whenever the topology catches up with bitcoind: recheck any
- * channels still deferring on a spent report (mempool case), since a
- * confirmed spend would have fired the funding watch and moved the
- * channel onchain already. */
-static void reconcile_sync_waiter(struct chain_topology *topo UNUSED,
-				  struct lightningd *ld)
+/* Called on every new block (notify_new_block): recheck any channels
+ * still deferring on a spent report (mempool case), since a confirmed
+ * spend would have fired the funding watch and moved the channel
+ * onchain already.  Not a topology sync waiter: that list is a one-shot
+ * "not synced yet" latch (topology_synced()), so re-arming it would
+ * wedge sync reporting. */
+void channel_reconcile_notify_new_block(struct lightningd *ld)
 {
 	struct peer *peer;
 	struct peer_node_id_map_iter it;
@@ -228,11 +244,4 @@ void channel_reconcile_funding(struct lightningd *ld)
 			io_loop_with_timers(ld);
 	}
 	tal_free(pend);
-
-	/* Recheck deferred channels whenever the topology catches up:
-	 * covers both the mempool-eviction recovery and a periodic
-	 * re-confirmation of the deferral.  Registered unconditionally
-	 * (a no-op walk when nothing is deferred). */
-	topology_add_sync_waiter(ld, ld->topology,
-				 reconcile_sync_waiter, ld);
 }

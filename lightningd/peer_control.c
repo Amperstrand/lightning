@@ -2128,8 +2128,11 @@ void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 		/* In this case, we'll send an error below, but send reestablish reply first
 		 * in case they lost their state and need it */
 		if (msgtype == WIRE_CHANNEL_REESTABLISH && channel_state_closed(channel->state)) {
-			/* Maybe we know it's closed, but they don't?  Happy to negotiate again. */
-			if (channel->state == CLOSINGD_COMPLETE) {
+			/* Maybe we know it's closed, but they don't?  Happy to negotiate again.
+			 * (Not if the funding spend is unresolved: fall through to the
+			 * gate below, which errors and disconnects.) */
+			if (channel->state == CLOSINGD_COMPLETE
+			    && !channel_funding_spend_unresolved(channel)) {
 				pfd = sockpair(tmpctx, channel, &other_fd, &error);
 				if (!pfd)
 					goto send_error;
