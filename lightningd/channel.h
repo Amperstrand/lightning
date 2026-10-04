@@ -213,6 +213,12 @@ struct channel {
 	/* Watch we have on inflights. */
 	struct txowatch **inflight_spend_watches;
 
+	/* Startup reconciliation (channel_reconcile.c): bitcoind reported
+	 * the funding output spent (confirmed or mempool) while this
+	 * channel is in a live state; block subdaemon attach until the
+	 * spend is reconciled.  Memory-only: recomputed at every boot. */
+	bool funding_spent_unresolved;
+
 	/* If we're doing a replay for onchaind, here are the txids it's watching */
 	struct replay_tx_hash *onchaind_replay_watches;
 	/* Number of outstanding onchaind_spent calls */

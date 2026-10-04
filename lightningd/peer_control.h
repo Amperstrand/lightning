@@ -113,6 +113,10 @@ u8 *p2tr_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx);
 /* We've loaded peers from database, set them going. */
 void setup_peers(struct lightningd *ld);
 
+/* True when we're shutting down and this channel has no pending HTLCs */
+bool ignore_idle_channel(const struct lightningd *ld,
+			 const struct channel *channel);
+
 /* When database first writes peer into db, it sets the dbid */
 void peer_set_dbid(struct peer *peer, u64 dbid);
 

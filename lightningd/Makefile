@@ -8,6 +8,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/channel.c			\
 	lightningd/channel_control.c		\
 	lightningd/channel_gossip.c		\
+	lightningd/channel_reconcile.c		\
 	lightningd/closing_control.c		\
 	lightningd/coin_mvts.c			\
 	lightningd/dual_open_control.c		\
