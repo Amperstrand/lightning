@@ -2051,24 +2051,29 @@ bool peer_start_channeld(struct channel *channel,
 	 * (blocks processed during startup catch-up, before channeld
 	 * attached) were dropped: without this replay the freshly
 	 * attached channeld parks in CHANNELD_AWAITING_SPLICE until an
-	 * arbitrary next block re-fires the depth watch. */
-	list_for_each(&channel->inflights, inflight, list) {
-		u32 splice_depth;
+	 * arbitrary next block re-fires the depth watch.  Splice
+	 * channels only: dual-funding candidates are driven by
+	 * dualopend, which does not speak this message. */
+	if (channel->state == CHANNELD_AWAITING_SPLICE) {
+		list_for_each(&channel->inflights, inflight, list) {
+			u32 splice_depth;
 
-		if (!inflight->scid)
-			continue;
-		splice_depth = get_block_height(ld->topology)
-			- short_channel_id_blocknum(*inflight->scid);
-		log_debug(channel->log,
-			  "Replaying confirmed splice depth %u for txid %s",
-			  splice_depth,
-			  fmt_bitcoin_txid(tmpctx,
-					   &inflight->funding->outpoint.txid));
-		subd_send_msg(channel->owner,
-			      take(towire_channeld_funding_depth(
-				   NULL, inflight->scid, splice_depth,
-				   true,
-				   &inflight->funding->outpoint.txid)));
+			if (!inflight->scid)
+				continue;
+			splice_depth = get_block_height(ld->topology)
+				- short_channel_id_blocknum(*inflight->scid);
+			log_debug(channel->log,
+				  "Replaying confirmed splice depth %u for"
+				  " txid %s",
+				  splice_depth,
+				  fmt_bitcoin_txid(tmpctx,
+						   &inflight->funding->outpoint.txid));
+			subd_send_msg(channel->owner,
+				      take(towire_channeld_funding_depth(
+					   NULL, inflight->scid, splice_depth,
+					   true,
+					   &inflight->funding->outpoint.txid)));
+		}
 	}
 	return true;
 }

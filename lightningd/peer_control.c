@@ -2824,6 +2824,14 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 	if (!dead)
 		return KEEP_WATCHING;
 
+	/* Only splice channels act here: channeld_abort is a channeld
+	 * message, and dual-funding candidates are driven by dualopend
+	 * (messaging or deleting them from under it corrupts its
+	 * candidate set - and crashes the daemon on the invalid
+	 * message). */
+	if (channel->state != CHANNELD_AWAITING_SPLICE)
+		return KEEP_WATCHING;
+
 	if (!channel->owner) {
 		/* Startup catch-up: no channeld to abort.  Drop the dead
 		 * inflight(s) now so the channel starts clean on the
