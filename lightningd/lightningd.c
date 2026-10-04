@@ -63,6 +63,7 @@
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
+#include <lightningd/channel_reconcile.h>
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closed_channel.h>
 #include <lightningd/connect_control.h>
@@ -1393,6 +1394,14 @@ int main(int argc, char *argv[])
 	db_begin_transaction(ld->wallet->db);
 	htlcs_resubmit(ld, unconnected_htlcs_in);
 	db_commit_transaction(ld->wallet->db);
+
+	/*~ Reconcile spent-funding channels before any peer can attach a
+	 * subdaemon: if bitcoind already reports a live-state channel's
+	 * funding output spent (confirmed or in mempool), block its
+	 * attach and let the funding spend watch take it onchain, instead
+	 * of resurrecting a dead channel that would ask the signer for
+	 * new commitments. */
+	channel_reconcile_funding(ld);
 
 	/*~ Activate connect daemon.  Needs to be after the initialization of
 	 * chaintopology, otherwise peers may connect and ask for
