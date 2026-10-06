@@ -1425,8 +1425,10 @@ peer_connected_serialize(struct peer_connected_hook_payload *payload,
 	json_object_end(stream); /* .peer */
 }
 
-static bool ignore_idle_channel(const struct lightningd *ld,
-				const struct channel *channel)
+/* Non-static: channel_reconcile.c consults it before attaching subdaemons
+ * (startup reconciliation, PR#3 lineage). Declared in peer_control.h. */
+bool ignore_idle_channel(const struct lightningd *ld,
+			 const struct channel *channel)
 {
 	return ld->state == LD_STATE_GRACE
 		&& !channel_has_htlc_out(channel)
