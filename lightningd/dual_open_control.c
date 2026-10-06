@@ -601,8 +601,14 @@ rbf_channel_hook_deserialize(struct rbf_channel_payload *payload,
 		      json_tok_full(buffer, toks));
 
 	if (!hook_extract_psbt(payload, dualopend, buffer, toks,
-			       "rbf_channel", true, &payload->psbt))
+			       "rbf_channel", true, &payload->psbt)) {
+		/* Fork #270: dangling-destructor guard (see changed-hook). */
+		if (dualopend)
+			tal_del_destructor2(dualopend,
+					    rbf_channel_remove_dualopend,
+					    payload);
 		return false;
+	}
 
 	if (payload->psbt) {
 		enum tx_role our_role = channel->opener == LOCAL ?
@@ -769,8 +775,14 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 		      json_tok_full(buffer, toks));
 
 	if (!hook_extract_psbt(payload, dualopend, buffer, toks,
-			       "openchannel2", true, &payload->psbt))
+			       "openchannel2", true, &payload->psbt)) {
+		/* Fork #270: dangling-destructor guard (see changed-hook). */
+		if (dualopend)
+			tal_del_destructor2(dualopend,
+					    openchannel2_remove_dualopend,
+					    payload);
 		return false;
+	}
 
 	shutdown_script =
 		hook_extract_shutdown_script(dualopend, buffer, toks);
@@ -868,8 +880,17 @@ openchannel2_changed_deserialize(struct openchannel2_psbt_payload *payload,
 
 	if (!hook_extract_psbt(NULL, dualopend, buffer,
 			       toks, "openchannel2_changed",
-			       false, &psbt))
+			       false, &psbt)) {
+		/* Fork #270: the abort path frees the payload via the hook
+		 * cb; drop our dualopend-side destructor entry first or it
+		 * fires with a dangling arg when the abort kills the
+		 * subd. */
+		if (dualopend)
+			tal_del_destructor2(dualopend,
+					    openchannel2_psbt_remove_dualopend,
+					    payload);
 		return false;
+	}
 
 	/* Add serials to PSBT, before checking for required fields */
 	psbt_add_serials(psbt, TX_ACCEPTER);
@@ -922,8 +943,15 @@ openchannel2_signed_deserialize(struct openchannel2_psbt_payload *payload,
 
 	if (!hook_extract_psbt(NULL, dualopend, buffer,
 			       toks, "openchannel2_sign",
-			       false, &psbt))
+			       false, &psbt)) {
+		/* Fork #270: same dangling-destructor guard as the
+		 * changed-hook abort branch. */
+		if (dualopend)
+			tal_del_destructor2(dualopend,
+					    openchannel2_psbt_remove_dualopend,
+					    payload);
 		return false;
+	}
 
 	/* We require the PSBT to meet certain criteria such as
 	 * extra, proprietary fields (`serial_id`s) or
@@ -4306,6 +4334,11 @@ static void forget_channel_open(struct channel *channel, const char *why)
 		return;
 
 	log_info(channel->log, "%s. Deleting channel.", why);
+	/* Fork #270: on the sign-hook abort path open_attempt is already
+	 * freed, so channel_cleanup_commands' notify (gated on it) never
+	 * fires — emit here so listeners (spenderp's multifundchannel)
+	 * fail the driving command instead of waiting on a dead open. */
+	notify_channel_open_failed(channel->peer->ld, &channel->cid);
 	delete_channel(channel, false);
 }
 

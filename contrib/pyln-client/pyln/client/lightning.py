@@ -691,13 +691,17 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("dev", payload)
 
-    def dev_sign_last_tx(self, peer_id):
+    def dev_sign_last_tx(self, peer_id, unsigned=False):
         """
         Sign and show the last commitment transaction with peer {id}.
+        With unsigned=True, return the unsigned transaction (txid-only
+        preview; does not ask the HSM to sign a commitment).
         """
         payload = {
             "id": peer_id
         }
+        if unsigned:
+            payload["unsigned"] = True
         return self.call("dev-sign-last-tx", payload)
 
     def dev_slowcmd(self, msec=None):

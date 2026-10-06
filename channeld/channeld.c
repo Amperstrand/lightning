@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <hsmd/hsmd_wiregen.h>
+#include <wire/wire.h>
 #include <inttypes.h>
 #include <wire/wire_sync.h>
 
@@ -99,6 +100,12 @@ struct peer {
 
 	/* Local next per-commit point. */
 	struct pubkey next_local_per_commit;
+	/* fork-local: the point next_local_per_commit replaced at its last
+	 * rotation — the splice-resume retry axis (l1 may have missed the
+	 * revoke that announced the new point; see
+	 * docs/HACK-SPLICE-RESUME-FEE-RETRY.md). */
+	struct pubkey prev_local_per_commit;
+	bool have_prev_local_per_commit;
 
 	/* Remote's current per-commit point. */
 	struct pubkey remote_per_commit;
@@ -216,6 +223,27 @@ static void billboard_update(const struct peer *peer)
 					       num_channel_htlcs(peer->channel));
 
 	peer_billboard(false, update);
+}
+
+
+/* A vls signer refusal is delivered as hsmd msg 115
+ * (HsmdInitReplyFailure: u16 type, u32 error_code, trailing text).
+ * Returns the text, NUL-terminated (best effort: the payload is the
+ * signer's refusal message, not attacker-controlled wire input from a
+ * peer). */
+static const char *hsmd_refusal_text(const tal_t *ctx, const u8 *msg)
+{
+	const u8 *tail;
+	size_t len;
+
+	if (tal_bytelen(msg) < 6)
+		return "(short refusal payload)";
+	tail = msg + 6;
+	len = tal_bytelen(msg) - 6;
+	/* Strip a trailing WireString framing byte-run of non-printables */
+	while (len > 0 && (tail[len-1] < ' ' || tail[len-1] > '~'))
+		len--;
+	return tal_strndup(ctx, (const char *)tail, len);
 }
 
 const u8 *hsm_req(const tal_t *ctx, const u8 *req TAKES)
@@ -490,6 +518,9 @@ static void check_mutual_splice_locked(struct peer *peer)
 	peer->channel->view[REMOTE].lowest_splice_amnt[REMOTE] = 0;
 
 	status_debug("mutual splice_locked, scid LOCAL & REMOTE updated to: %s",
+		     fmt_short_channel_id(tmpctx,
+					  peer->splice_state->short_channel_id));
+	status_debug("SPLICE-NARRATE ev=mutual_splice_locked scid=%s",
 		     fmt_short_channel_id(tmpctx,
 					  peer->splice_state->short_channel_id));
 
@@ -1434,6 +1465,101 @@ static void send_message_batch(struct peer *peer, u8 **msgs)
 	peer_write(peer->pps, take(final_msg));
 }
 
+/* fork #125: frame/unframe a batch of wire messages for durable storage:
+ * u16 count, then per message u32 length + bytes. */
+static u8 *frame_msg_batch(const tal_t *ctx, const u8 *const *msgs,
+			   size_t num_msgs)
+{
+	u8 *blob = tal_arr(ctx, u8, 0);
+	size_t i;
+
+	towire_u16(&blob, num_msgs);
+	for (i = 0; i < num_msgs; i++) {
+		towire_u32(&blob, tal_bytelen(msgs[i]));
+		towire_u8_array(&blob, msgs[i], tal_bytelen(msgs[i]));
+	}
+	return blob;
+}
+
+static u8 **unframe_msg_batch(const tal_t *ctx, const u8 *blob, size_t blob_len)
+{
+	const u8 *cursor = blob;
+	size_t max = blob_len;
+	u16 count, i;
+	u8 **msgs;
+
+	count = fromwire_u16(&cursor, &max);
+	msgs = tal_arr(ctx, u8 *, count);
+	for (i = 0; i < count; i++) {
+		u32 mlen = fromwire_u32(&cursor, &max);
+		if (mlen > max)
+			return tal_free(msgs);
+		msgs[i] = tal_arr(msgs, u8, mlen);
+		fromwire_u8_array(&cursor, &max, msgs[i], mlen);
+	}
+	if (max != 0)
+		return tal_free(msgs);
+	return msgs;
+}
+
+/* fork #125: persist the exact commitment_signed bytes BEFORE the wire
+ * write — the splice resume must replay these, never re-sign: rebuilds
+ * drift (changed fee/view set) and a validating signer refuses the
+ * same-number reshuffle (the R7.2 retransmit contract). */
+static void store_sent_commitsigs(struct peer *peer,
+				  u64 commitnum,
+				  const u8 *const *msgs,
+				  size_t num_msgs)
+{
+	u8 *blob = frame_msg_batch(tmpctx, msgs, num_msgs);
+	u8 *msg = towire_channeld_store_sent_commitsig(NULL, commitnum, blob);
+	/* #125 latency probe: the persist-then-send round-trip cost */
+	double t0 = time_now().ts.tv_sec + time_now().ts.tv_nsec / 1e9;
+	master_wait_sync_reply(tmpctx, peer, take(msg),
+			       WIRE_CHANNELD_STORE_SENT_COMMITSIG_REPLY);
+	status_debug("store_sent_commitsigs: %zu usec (num %"PRIu64
+		     ", %zu msgs)",
+		     (size_t)((time_now().ts.tv_sec + time_now().ts.tv_nsec / 1e9 - t0) * 1000000),
+		     commitnum, num_msgs);
+}
+
+/* fork #125 resume: REPLAY the durably stored commitment_signed batch
+ * for this number. Returns true if we replayed. */
+static bool maybe_replay_commitments(struct peer *peer, u64 commitnum)
+{
+	u8 *msg, *reply;
+	u64 num;
+	u8 *blob;
+	u8 **stored;
+
+	msg = towire_channeld_fetch_sent_commitsig(NULL, commitnum);
+	reply = master_wait_sync_reply(tmpctx, peer, take(msg),
+				       WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT);
+	if (!fromwire_channeld_fetch_sent_commitsig_result(tmpctx, reply,
+							   &num, &blob))
+		master_badmsg(WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT, reply);
+	if (num != commitnum || !blob || tal_bytelen(blob) == 0) {
+		status_debug("Splice resume: no stored batch for num %"PRIu64
+			     " (fetched num %"PRIu64", blob %zu)",
+			     commitnum, num, blob ? tal_bytelen(blob) : 0);
+		return false;
+	}
+	stored = unframe_msg_batch(tmpctx, blob, tal_bytelen(blob));
+	if (!stored || tal_count(stored) == 0)
+		return false;
+	status_debug("Splice resume: replaying %zu stored commitment_signed "
+		     "msgs at num %"PRIu64, tal_count(stored), commitnum);
+	/* fork narration: every splice state-machine decision emits a
+	 * SPLICE-NARRATE line (key=value; greppable from ordinary gate
+	 * logs; splice-dev/bin/splice-narrate.py merges both nodes'
+	 * lines into a cross-view timeline and flags split-brain
+	 * divergence — the observability layer for UC-1/2/3). */
+	status_debug("SPLICE-NARRATE ev=commit_replay num=%"PRIu64
+		     " msgs=%zu", commitnum, tal_count(stored));
+	send_message_batch(peer, stored);
+	return true;
+}
+
 static void send_commit(struct peer *peer)
 {
 	const struct htlc **changed_htlcs;
@@ -1598,6 +1724,14 @@ static void send_commit(struct peer *peer)
 						anchors_info);
 	wire_sync_write(MASTER_FD, take(msg));
 
+	/* fork #125: persist the exact bytes before the wire write (the
+	 * index these msgs were built at is the pre-increment value). */
+	store_sent_commitsigs(peer, peer->next_index[REMOTE],
+			      (const u8 *const *)msgs, tal_count(msgs));
+	status_debug("SPLICE-NARRATE ev=commit_send num=%"PRIu64
+		     " replayed=0 msgs=%zu", peer->next_index[REMOTE],
+		     tal_count(msgs));
+
 	peer->next_index[REMOTE]++;
 
 	send_message_batch(peer, msgs);
@@ -1742,6 +1876,25 @@ static void marshall_htlc_info(const tal_t *ctx,
 	}
 }
 
+/* fork-local: rotate next_local_per_commit, stashing the previous point
+ * for the splice-resume retry. */
+static void peer_set_local_per_commit(struct peer *peer,
+				      const struct pubkey *new_pc)
+{
+	if (peer->have_prev_local_per_commit
+	    && pubkey_eq(&peer->next_local_per_commit, new_pc))
+		return;
+	peer->prev_local_per_commit = peer->next_local_per_commit;
+	peer->have_prev_local_per_commit = true;
+	peer->next_local_per_commit = *new_pc;
+	/* fork-local diagnostics: every cache write, with the index the
+	 * validation build will pair it with (the point-desync decode —
+	 * see docs/HACK-SPLICE-RESUME-FEE-RETRY.md). */
+	status_unusual("fork-cache-write: next_index[LOCAL]=%"PRIu64
+		       " point=%s", peer->next_index[LOCAL],
+		       fmt_pubkey(tmpctx, new_pc));
+}
+
 static void send_revocation(struct peer *peer,
 			    const struct bitcoin_signature *commit_sig,
 			    const struct bitcoin_signature *htlc_sigs,
@@ -1797,8 +1950,12 @@ static void send_revocation(struct peer *peer,
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one. */
-	msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2,
-				  &peer->next_local_per_commit);
+	{
+		struct pubkey fork_new_pc;
+		msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2,
+					  &fork_new_pc);
+		peer_set_local_per_commit(peer, &fork_new_pc);
+	}
 
 	/* Now we can finally send revoke_and_ack to peer */
 	peer_write(peer->pps, take(msg));
@@ -2332,10 +2489,22 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	msg2 = hsm_req(tmpctx, take(msg2));
 	struct secret *old_secret;
 	struct pubkey next_point;
-	if (!fromwire_hsmd_validate_commitment_tx_reply(tmpctx, msg2, &old_secret, &next_point))
+	if (!fromwire_hsmd_validate_commitment_tx_reply(tmpctx, msg2, &old_secret, &next_point)) {
+		/* A signer refusal arrives as hsmd msg 115 — a DELIVERED
+		 * answer, not wire corruption.  STATUS_FAIL_HSM_IO here is
+		 * fatal to lightningd (hsmd IO is sacred by design); a
+		 * policy refusal is a channel-level condition: fail the
+		 * channel, keep the node alive.  Live shape: strict
+		 * splice_locked_then_force_close, the late post-payment
+		 * commitment racing the close-start refusal. */
+		if (fromwire_peektype(msg2) == 115)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "hsmd refused validate_commitment_tx: %s",
+				      hsmd_refusal_text(tmpctx, msg2));
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading validate_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg2));
+	}
 
 	struct commitsig *commitsig;
 	commitsig = tal(tmpctx, struct commitsig);
@@ -3139,6 +3308,23 @@ static const u8 *peer_expect_msg_four(const tal_t *ctx,
 
 	msg = peer_read(ctx, peer->pps);
 	type = fromwire_peektype(msg);
+	/* fork #124 (inr2-splice-harness): a belated
+	 * announcement_signatures for a prior funding can land in the
+	 * commitment-exchange window too — process it inline (the same
+	 * handler peer_in dispatches to; the STFU gate already exempts
+	 * this type) and read again. Failing the peer here is the #124
+	 * race: a healthy gossip exchange colliding with a healthy
+	 * splice. */
+	while (type == WIRE_ANNOUNCEMENT_SIGNATURES) {
+		status_debug("Splice: processing belated"
+			     " announcement_signatures mid-commitment-wait");
+		status_debug("SPLICE-NARRATE ev=sig_wait_tolerate"
+			     " reader=commitment"
+			     " type=announcement_signatures");
+		handle_peer_announcement_signatures(peer, msg);
+		msg = peer_read(ctx, peer->pps);
+		type = fromwire_peektype(msg);
+	}
 	if (type != expect_type
 	    && type != second_allowed_type
 	    && type != third_allowed_type
@@ -3161,6 +3347,24 @@ static const u8 *peer_expect_msg_four(const tal_t *ctx,
  * order. */
 static void peer_in(struct peer *peer, const u8 *msg);
 
+/* fork #124 (inr2-splice-harness): re-inject any
+ * announcement_signatures parked by common/interactivetx.c's
+ * read_next_msg — the gossip handshake must not be starved by a
+ * healthy splice. peer_in dispatches it through the normal handler
+ * (the STFU gate already exempts announcement_signatures). */
+static void reinject_parked_announce(struct peer *peer,
+				     struct interactivetx_context *ictx)
+{
+	if (!ictx->deferred_announce_sigs)
+		return;
+	status_debug("Splice: re-injecting parked"
+		     " announcement_signatures after negotiation");
+	status_debug("SPLICE-NARRATE ev=announce_reinject reader=txneg");
+	peer_in(peer, ictx->deferred_announce_sigs);
+	ictx->deferred_announce_sigs
+		= tal_free(ictx->deferred_announce_sigs);
+}
+
 /* The question of "who signs splice commitments first" is the same order as the
  * splice `tx_signature`s are. This function handles sending & receiving the
  * required commitments as part of the splicing process.
@@ -3172,6 +3376,7 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 						      size_t inflight_index,
 						      bool send_commitments,
 						      bool recv_commitments,
+						      bool resuming,
 						      const u8 **msg_received,
 						      int allowed_premature_msg)
 {
@@ -3198,18 +3403,31 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 			     our_role == TX_INITIATOR ? "initiator" : "accepter",
 			     next_index_local, next_index_remote);
 
-		peer_write(peer->pps, send_commit_part(tmpctx,
-						       peer,
-						       &inflight->outpoint,
-						       inflight->amnt,
-						       NULL, false,
-						       inflight->splice_amnt,
-						       remote_splice_amnt,
-						       next_index_remote - 1,
-						       &peer->old_remote_per_commit,
-						       &local_anchor,
-						       1,
-						       inflight->remote_funding));
+		/* fork #125: on resume, REPLAY the durably stored bytes
+		 * instead of re-signing (rebuilds drift; a validating
+		 * signer refuses the same-number reshuffle). */
+		if (!resuming
+		    || !maybe_replay_commitments(peer, next_index_remote - 1)) {
+			u8 *csmsg = send_commit_part(tmpctx,
+						     peer,
+						     &inflight->outpoint,
+						     inflight->amnt,
+						     NULL, false,
+						     inflight->splice_amnt,
+						     remote_splice_amnt,
+						     next_index_remote - 1,
+						     &peer->old_remote_per_commit,
+						     &local_anchor,
+						     1,
+						     inflight->remote_funding);
+			const u8 *one[1];
+			one[0] = csmsg;
+			store_sent_commitsigs(peer, next_index_remote - 1,
+					      one, 1);
+			status_debug("SPLICE-NARRATE ev=commit_send num=%"PRIu64
+				     " replayed=0", next_index_remote - 1);
+			peer_write(peer->pps, csmsg);
+		}
 	}
 
 	result = NULL;
@@ -3274,18 +3492,31 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 			     our_role == TX_INITIATOR ? "initiator" : "accepter",
 			     next_index_local, next_index_remote);
 
-		peer_write(peer->pps, send_commit_part(tmpctx,
-						       peer,
-						       &inflight->outpoint,
-						       inflight->amnt,
-						       NULL, false,
-						       inflight->splice_amnt,
-						       remote_splice_amnt,
-						       next_index_remote - 1,
-						       &peer->old_remote_per_commit,
-						       &local_anchor,
-						       1,
-						       inflight->remote_funding));
+		/* fork #125: on resume, REPLAY the durably stored bytes
+		 * instead of re-signing (rebuilds drift; a validating
+		 * signer refuses the same-number reshuffle). */
+		if (!resuming
+		    || !maybe_replay_commitments(peer, next_index_remote - 1)) {
+			u8 *csmsg = send_commit_part(tmpctx,
+						     peer,
+						     &inflight->outpoint,
+						     inflight->amnt,
+						     NULL, false,
+						     inflight->splice_amnt,
+						     remote_splice_amnt,
+						     next_index_remote - 1,
+						     &peer->old_remote_per_commit,
+						     &local_anchor,
+						     1,
+						     inflight->remote_funding);
+			const u8 *one[1];
+			one[0] = csmsg;
+			store_sent_commitsigs(peer, next_index_remote - 1,
+					      one, 1);
+			status_debug("SPLICE-NARRATE ev=commit_send num=%"PRIu64
+				     " replayed=0", next_index_remote - 1);
+			peer_write(peer->pps, csmsg);
+		}
 	}
 
 	/* Sending and receiving splice commit should not increment commit
@@ -3397,33 +3628,44 @@ static size_t calc_weight(enum tx_role role, const struct wally_psbt *psbt,
 static struct amount_msat
 relative_splice_balance_fundee(struct peer *peer,
 			       enum tx_role our_role,
-			       const struct wally_psbt *psbt,
-			       int chan_output_index,
-			       int chan_input_index)
+			       const struct wally_psbt *psbt UNUSED,
+			       int chan_output_index UNUSED,
+			       int chan_input_index UNUSED)
 {
-	/* Relative fundee channel balance */
-	u64 push_value;
+	/* The fundee is the side that did not open the channel.  Select its
+	 * funding contribution by CHANNEL role, not splice role: the splice
+	 * initiator is not necessarily the channel opener (the fundee can
+	 * initiate a splice-in). */
+	enum side fundee_side = peer->channel->opener == LOCAL ? REMOTE : LOCAL;
+	bool fundee_is_splice_initiator =
+		(fundee_side == LOCAL) == (our_role == TX_INITIATOR);
+	s64 fundee_contribution = fundee_is_splice_initiator
+		? peer->splicing->opener_relative
+		: peer->splicing->accepter_relative;
 
-	/* We calculcate the `push_value` to send to the
-	 * hsmd, that is the remote amount in the channel
-	 * after the splice. */
-	switch (our_role) {
-	case TX_INITIATOR:
-		/* push_value is the fundee relative value so if we open the channel
-		 * fundee is the remote node. */
-		push_value = peer->splicing->accepter_relative;
-		break;
-	case TX_ACCEPTER:
-		/* push_value is the fundee relative value so if the remote node open the channel
-		 * fundee in this case is the opener. */
-		push_value = peer->splicing->opener_relative;
-		break;
-	default:
-		/* This should never happen. Help us to early catch the tx_role change */
-		abort();
-	}
+	/* The fundee's pre-splice balance; views agree on owed[].  The
+	 * hsmd setup push_value must carry the fundee's post-splice
+	 * balance.  owed[] is an upper bound of the fundee's output in
+	 * the first post-splice commitment (pending HTLCs only reduce
+	 * it), so it is a safe entitlement floor for a validating
+	 * signer. */
+	struct amount_msat push_value_msat
+		= peer->channel->view[LOCAL].owed[fundee_side];
 
-	return amount_msat(push_value);
+	/* opener_relative/accepter_relative are SATOSHI funding contributions
+	 * (see their amount_msat_add_sat_s64 callers); the hsmd_setup_channel
+	 * push_value field is amount_msat.  Reporting only the contribution
+	 * (or wrapping sats into msat) under-reports the fundee's
+	 * post-splice balance, which a validating signer (VLS strict
+	 * policy-commitment-initial-funding-value) reads as an overpayment and
+	 * refuses - wedging the splice. */
+	if (fundee_contribution == INT64_MIN ||
+	    !amount_msat_add_sat_s64(&push_value_msat, push_value_msat,
+				     fundee_contribution))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "splice funding contribution out of range for fundee balance");
+
+	return push_value_msat;
 }
 
 static struct amount_sat calc_balance(struct peer *peer)
@@ -3862,6 +4104,7 @@ static void resume_splice_negotiation(struct peer *peer,
 				      bool recv_commitments,
 				      bool send_signature,
 				      bool recv_signature,
+				      bool resuming,
 				      int allowed_premature_msg)
 {
 	struct inflight *inflight = last_inflight(peer);
@@ -3921,6 +4164,7 @@ static void resume_splice_negotiation(struct peer *peer,
 						    last_inflight_index(peer),
 						    send_commitments,
 						    recv_commitments,
+						    resuming,
 						    &msg_received,
 						    allowed_premature_msg);
 
@@ -4038,6 +4282,42 @@ static void resume_splice_negotiation(struct peer *peer,
 		else {
 			status_debug("Splice: Awaiting signature message");
 			msg = peer_read(tmpctx, peer->pps);
+			/* fork #124/#130: the signature-wait must tolerate
+			 * EVERY belated-but-benign message in ANY order —
+			 * announcement_signatures (the #124 race) and the
+			 * reestablish-time channel_ready retransmit (both
+			 * commit numbers still 1). Two separate one-shot
+			 * blocks were not enough: a fast peer delivers
+			 * [channel_ready, announce] back-to-back and the
+			 * SECOND read fell through (VM A/B catch, 2026-09-04
+			 * — the loaded dev box never hit the ordering). One
+			 * unified loop, process-and-reread until a real
+			 * message arrives. */
+			for (;;) {
+				if (fromwire_peektype(msg)
+				    == WIRE_ANNOUNCEMENT_SIGNATURES) {
+					status_debug("Splice: processing belated"
+						     " announcement_signatures"
+						     " mid-signature-wait");
+					status_debug("SPLICE-NARRATE"
+						     " ev=sig_wait_tolerate"
+						     " reader=signature"
+						     " type=announcement_signatures");
+					handle_peer_announcement_signatures(peer, msg);
+				} else if (allowed_premature_msg
+					   && fromwire_peektype(msg)
+					      == allowed_premature_msg) {
+					status_debug("SPLICE-NARRATE"
+						     " ev=sig_wait_tolerate"
+						     " reader=signature"
+						     " type=%s",
+						     peer_wire_name(fromwire_peektype(msg)));
+					peer_in(peer, msg);
+				} else {
+					break;
+				}
+				msg = peer_read(tmpctx, peer->pps);
+			}
 			status_debug("Splice: Got peer message! (is signature?)");
 		}
 
@@ -4437,6 +4717,7 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 	error = process_interactivetx_updates(tmpctx, ictx,
 					      &peer->splicing->received_tx_complete,
 					      &abort_msg);
+	reinject_parked_announce(peer, ictx);
 	if (error)
 		peer_failed_err(peer->pps, &peer->channel_id,
 				"Interactive splicing error: %s", error);
@@ -4507,7 +4788,7 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 
 	peer->splice_state->count++;
 
-	resume_splice_negotiation(peer, true, true, true, true, 0);
+	resume_splice_negotiation(peer, true, true, true, true, false, 0);
 }
 
 /* splice_initiator runs when splice_ack is received by the other side. It
@@ -4702,6 +4983,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	error = process_interactivetx_updates(tmpctx, ictx,
 					      &peer->splicing->received_tx_complete,
 					      &abort_msg);
+	reinject_parked_announce(peer, ictx);
 	if (error)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Splice interactivetx error: %s", error);
@@ -4821,7 +5103,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	their_commit = interactive_send_commitments(peer, new_inflight->psbt,
 						    our_role,
 						    last_inflight_index(peer),
-						    true, true, NULL, 0);
+						    true, true, false, NULL, 0);
 
 	new_inflight->last_tx = tal_steal(new_inflight, their_commit->tx);
 	new_inflight->last_sig = their_commit->commit_signature;
@@ -4837,7 +5119,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 				     peer->splicing->force_sign_first);
 
 	if (!sign_first)
-		resume_splice_negotiation(peer, false, false, false, true, 0);
+		resume_splice_negotiation(peer, false, false, false, true, false, 0);
 
 	outmsg = towire_channeld_splice_confirmed_update(NULL,
 							 new_inflight->psbt,
@@ -4912,6 +5194,7 @@ static void splice_initiator_user_update(struct peer *peer, const u8 *inmsg)
 	error = process_interactivetx_updates(tmpctx, ictx,
 					      &peer->splicing->received_tx_complete,
 					      &abort_msg);
+	reinject_parked_announce(peer, ictx);
 	if (error)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				"Splice update error: %s", error);
@@ -5038,7 +5321,19 @@ static void splice_initiator_user_signed(struct peer *peer, const u8 *inmsg)
 	audit_psbt(inflight->psbt, inflight->psbt);
 	assert(tal_parent(inflight->psbt) != tmpctx);
 
-	resume_splice_negotiation(peer, false, false, true, sign_first, 0);
+	/* fork #130: if the peer signed early (while we were parked waiting
+	 * for the user's splice_signed), their tx_signatures sit cached in
+	 * splicing->tx_sig_msg — we must process them even when we sign
+	 * second, or the funding 2of2 witness never gets assembled and the
+	 * broadcast fails with an empty witness. */
+	status_debug("SPLICE-NARRATE ev=unpark cached_sigs=%d sign_first=%d",
+		     peer->splicing && peer->splicing->tx_sig_msg ? 1 : 0,
+		     sign_first ? 1 : 0);
+	resume_splice_negotiation(peer, false, false, true,
+				  sign_first
+				  || (peer->splicing
+				      && peer->splicing->tx_sig_msg),
+				  false, 0);
 
 	audit_psbt(inflight->psbt, inflight->psbt);
 	assert(tal_parent(inflight->psbt) != tmpctx);
@@ -5252,6 +5547,17 @@ static void peer_in(struct peer *peer, const u8 *msg)
 			peer->splicing->tx_sig_msg = tal_steal(peer->splicing,
 							       msg);
 			return;
+		} else if (type == WIRE_CHANNEL_READY
+			   && peer->channel_ready[REMOTE]) {
+			/* fork #130: the reestablish-time channel_ready
+			 * retransmit (fires while both commit numbers are
+			 * still 1) can land while we sit parked in STFU
+			 * awaiting the user's splice_signed. Redundant by
+			 * BOLT #2 ("MUST ignore any redundant
+			 * channel_ready") — same class as the belated
+			 * announcement_signatures below. */
+			status_debug("Ignoring redundant channel_ready"
+				     " while quiescent");
 		} else if (type != WIRE_ANNOUNCEMENT_SIGNATURES) {
 			peer_failed_warn(peer->pps, &peer->channel_id,
 					 "Received message %s when only TX_ABORT was"
@@ -5804,6 +6110,7 @@ static void peer_reconnect(struct peer *peer,
 	u64 send_next_commitment_number;
 
 	struct tlv_channel_reestablish_tlvs *send_tlvs, *recv_tlvs;
+	bool resume_park_user_sigs;
 
 	dataloss_protect = feature_negotiated(peer->our_features,
 					      peer->their_features,
@@ -5823,40 +6130,64 @@ static void peer_reconnect(struct peer *peer,
 	inflight = last_inflight(peer);
 
 	send_next_commitment_number = peer->next_index[LOCAL];
+	resume_park_user_sigs = false;
 	if (inflight && (!inflight->last_tx || !inflight->remote_tx_sigs)) {
 		if (missing_user_signatures(peer,
 					    inflight->i_am_initiator
 					        ? TX_INITIATOR
 					        : TX_ACCEPTER,
 					    inflight->psbt)) {
-			status_info("Unable to resume splice as user sig(s)"
-				    " are missing.");
-			inflight = NULL;
+			/* fork #130: upstream (5818b522f) nulls the inflight
+			 * here, which drops our next_funding TLV and then
+			 * mis-aborts the peer's valid resume as
+			 * "next_funding_txid not recognized". But user
+			 * signatures only gate the *signature* phase — the
+			 * commitment exchange (incl. the #125 replay of our
+			 * stored batch) is fully resumable. Park instead:
+			 * still send the TLV, resume commitments only, and
+			 * wait for `splice_signed` from the user. */
+			status_info("Resuming splice with user sig(s) still"
+				    " missing: negotiation will park at the"
+				    " signature phase until splice_signed.");
+			resume_park_user_sigs = true;
+			status_debug("SPLICE-NARRATE ev=reestablish_eval"
+				     " decision=park last_tx=%d remote_tx_sigs=%d"
+				     " user_sigs_missing=1",
+				     inflight->last_tx ? 1 : 0,
+				     inflight->remote_tx_sigs ? 1 : 0);
 		} else {
 			status_info("Reconnecting to peer with pending inflight"
 				    " commit: %s, remote sigs: %s.",
 				    inflight->last_tx ? "received" : "missing",
 				    inflight->remote_tx_sigs ? "received" : "missing");
-
-			if (!send_tlvs) {
-				/* Subtle: we free tmpctx below as we loop, so
-				 * tal off peer */
-				send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
-			}
-			send_tlvs->next_funding = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
-			send_tlvs->next_funding->next_funding_txid = inflight->outpoint.txid;
-
-			/* BOLT-??? #2:
-			 * The `next_funding.retransmit_flags` bitfield is used to let the
-			 * receiving peer know which messages they must retransmit for the
-			 * corresponding `next_funding_txid` after the reconnection:
-			 * | Bit Position  | Name                |
-			 * | ------------- | --------------------|
-			 * | 0             | `commitment_signed` |
-			 */
-			if (!inflight->last_tx)
-				send_tlvs->next_funding->retransmit_flags |= 1; /* commitment_signed */
 		}
+
+		/* fork #130: the TLV goes out either way — the peer needs
+		 * to know we still hold this inflight. */
+		if (!send_tlvs) {
+			/* Subtle: we free tmpctx below as we loop, so
+			 * tal off peer */
+			send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
+		}
+		send_tlvs->next_funding = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
+		send_tlvs->next_funding->next_funding_txid = inflight->outpoint.txid;
+
+		/* BOLT-??? #2:
+		 * The `next_funding.retransmit_flags` bitfield is used to let the
+		 * receiving peer know which messages they must retransmit for the
+		 * corresponding `next_funding_txid` after the reconnection:
+		 * | Bit Position  | Name                |
+		 * | ------------- | --------------------|
+		 * | 0             | `commitment_signed` |
+		 */
+		if (!inflight->last_tx)
+			send_tlvs->next_funding->retransmit_flags |= 1; /* commitment_signed */
+		status_debug("SPLICE-NARRATE ev=tlv_out txid=%s"
+			     " retransmit_flags=%u park=%d",
+			     fmt_bitcoin_txid(tmpctx,
+					      &send_tlvs->next_funding->next_funding_txid),
+			     send_tlvs->next_funding->retransmit_flags,
+			     resume_park_user_sigs ? 1 : 0);
 	}
 
 	/* BOLT-??? #2:
@@ -6039,6 +6370,21 @@ static void peer_reconnect(struct peer *peer,
 		    remote_next_funding ? "received" : "empty",
 		    tal_count(peer->splice_state->inflights));
 
+	/* fork #130: when parking for user sigs, reconstruct the splice
+	 * context so the later `splice_signed` (the interrupted user step)
+	 * passes the mode/tx_complete gates: commitments secured implies
+	 * the tx negotiation completed on both sides pre-crash. */
+	if (resume_park_user_sigs && inflight) {
+		status_debug("SPLICE-NARRATE ev=ctx_reconstruct txid=%s",
+			     fmt_bitcoin_txid(tmpctx, &inflight->outpoint.txid));
+		if (!peer->splicing)
+			peer->splicing = splicing_new(peer);
+		peer->splicing->mode = true;
+		peer->splicing->received_tx_complete = true;
+		peer->splicing->sent_tx_complete = true;
+		peer->splicing->current_psbt = inflight->psbt;
+	}
+
 	/* DTODO: Update splice BOLT spec PR and reference here. */
 	if (inflight && (remote_next_funding || local_next_funding)) {
 		if (!remote_next_funding) {
@@ -6047,6 +6393,12 @@ static void peer_reconnect(struct peer *peer,
 						  false,
 						  !inflight->last_tx,
 						  false,
+						  /* fork #130: parked resumes
+						   * must not block the main
+						   * loop on peer sigs — the
+						   * user's splice_signed
+						   * still has to arrive. */
+						  !resume_park_user_sigs,
 						  true,
 						  WIRE_CHANNEL_READY);
 		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
@@ -6058,13 +6410,30 @@ static void peer_reconnect(struct peer *peer,
 			/* If send & receive sigs we must assume stfu */
 			if (local_next_funding)
 				assume_stfu_mode(peer);
+			status_debug("SPLICE-NARRATE ev=resume_dispatch"
+				     " branch=txid_match txid=%s"
+				     " send_cs=%d recv_cs=%d park=%d",
+				     fmt_bitcoin_txid(tmpctx,
+						      &inflight->outpoint.txid),
+				     remote_next_funding
+				     	? remote_next_funding->retransmit_flags & 1 : 0,
+				     local_next_funding
+				     	&& !inflight->last_tx,
+				     resume_park_user_sigs ? 1 : 0);
 			resume_splice_negotiation(peer,
 						  remote_next_funding
 						  	? remote_next_funding->retransmit_flags & 1
 						  	: false,
 						  local_next_funding && !inflight->last_tx,
+						  /* fork #130: park at the
+						   * commitment phase when user
+						   * sigs are pending; the
+						   * signature phase resumes
+						   * from splice_signed. */
+						  !resume_park_user_sigs,
+						  local_next_funding
+						  	&& !resume_park_user_sigs,
 						  true,
-						  local_next_funding,
 						  WIRE_CHANNEL_READY);
 		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
 					   &peer->channel->funding.txid)) {
@@ -6099,9 +6468,14 @@ static void peer_reconnect(struct peer *peer,
 				    " is negotiating one that matches current"
 				    " channel, ignoring it: %s",
 				    fmt_bitcoin_outpoint(tmpctx, &peer->channel->funding));
-		else
+		else {
+			status_debug("SPLICE-NARRATE ev=abort_dispatch"
+				     " reason=next_funding_unrecognized"
+				     " local_inflight=%d",
+				     inflight ? 1 : 0);
 			splice_abort(peer, NULL,
 				     "next_funding_txid not recognized.");
+		}
 	}
 
 	/* "none of those channel_reestablish messages contain
@@ -6909,6 +7283,10 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_SPLICE_CONFIRMED_UPDATE:
 	case WIRE_CHANNELD_SPLICE_LOOKUP_TX:
 	case WIRE_CHANNELD_SPLICE_LOOKUP_TX_RESULT:
+	case WIRE_CHANNELD_STORE_SENT_COMMITSIG:
+	case WIRE_CHANNELD_STORE_SENT_COMMITSIG_REPLY:
+	case WIRE_CHANNELD_FETCH_SENT_COMMITSIG:
+	case WIRE_CHANNELD_FETCH_SENT_COMMITSIG_RESULT:
 	case WIRE_CHANNELD_SPLICE_FEERATE_ERROR:
 	case WIRE_CHANNELD_SPLICE_FUNDING_ERROR:
 	case WIRE_CHANNELD_SPLICE_ABORT:
@@ -7109,8 +7487,12 @@ static void init_channel(struct peer *peer)
 	assert(peer->next_index[LOCAL] > 0);
 	assert(peer->next_index[REMOTE] > 0);
 
-	get_per_commitment_point(peer->next_index[LOCAL],
-				 &peer->next_local_per_commit);
+	{
+		struct pubkey fork_new_pc;
+		get_per_commitment_point(peer->next_index[LOCAL],
+					 &fork_new_pc);
+		peer_set_local_per_commit(peer, &fork_new_pc);
+	}
 
 	peer->channel = new_full_channel(peer, &peer->channel_id,
 					 &funding,

@@ -30,6 +30,7 @@ import sqlite3
 import string
 import struct
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -956,7 +957,14 @@ class LightningD(TailableProc):
         return self.cmd_prefix + [self.executable] + self.early_opts + opts
 
     def start(self, stdin=None, wait_for_initialized=True, stderr_redir=False):
-        self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
+        # NO_BTCPROXY=1: point the nodes at the REAL bitcoind port instead
+        # of the cheroot instrumentation proxy — long slowed runs saw the
+        # proxy's chain serving go silent mid-run. The proxy exists for
+        # canned-response instrumentation our splice runs never use.
+        if os.environ.get('NO_BTCPROXY', '') == '1':
+            self.opts['bitcoin-rpcport'] = self.rpcproxy.bitcoind.rpcport
+        else:
+            self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
         # On restart, the previous incarnation's connectd may still be
         # dying and holding our listen port: don't launch until it's free.
         wait_for_port_released(self.port)

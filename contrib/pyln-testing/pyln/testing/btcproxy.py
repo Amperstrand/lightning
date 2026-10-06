@@ -33,6 +33,17 @@ class BitcoinRpcProxy(object):
         self.mock_counts = {}
         self.bitcoind = bitcoind
         self.request_count = 0
+        # Pin the fee estimate: regtest bitcoind's estimatesmartfee drifts with
+        # the test's own tx traffic (observed 3750->3755 sat/kw across a crash
+        # window), and a crash-restart splice-resume re-offer at a DIFFERENT
+        # rate than the pre-crash exchange produces a different commitment tx
+        # -> the deterministic re-signing fails verification -> the flaky
+        # Bad-commit_sig loop. A fixed rate makes the re-offer byte-identical.
+        self.mocks['estimatesmartfee'] = {
+            "errors": [],
+            "blocks": 2,
+            "feerate": 0.00015,
+        }
 
     def _handle_request(self, r):
         brpc = BitcoinProxy(btc_conf_file=self.bitcoind.conf_file)
@@ -83,7 +94,12 @@ class BitcoinRpcProxy(object):
 
     def start(self):
         d = PathInfoDispatcher({'/': self.app})
-        self.server = Server(('127.0.0.1', self.rpcport), d)
+        # numthreads=50: the default pool (10) exhausts under slowed runs —
+        # getblock fetches for big regtest blocks each hold a thread for
+        # seconds; both nodes' polls + the block bursts queue behind them
+        # and the chain serving goes silent mid-run (the crash16 lockin
+        # stall). Keep master's loopback-only bind.
+        self.server = Server(('127.0.0.1', self.rpcport), d, numthreads=50)
         self.proxy_thread = threading.Thread(target=self.server.start)
         self.proxy_thread.daemon = True
         self.proxy_thread.start()

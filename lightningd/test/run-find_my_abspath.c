@@ -18,6 +18,9 @@ void channel_gossip_notify_new_block(struct lightningd *ld UNNEEDED)
 /* Generated stub for channel_notify_new_block */
 void channel_notify_new_block(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "channel_notify_new_block called!\n"); abort(); }
+/* Generated stub for channel_reconcile_funding */
+void channel_reconcile_funding(struct lightningd *ld UNNEEDED)
+{ fprintf(stderr, "channel_reconcile_funding called!\n"); abort(); }
 /* Generated stub for command_check_only */
 bool command_check_only(const struct command *cmd UNNEEDED)
 { fprintf(stderr, "command_check_only called!\n"); abort(); }

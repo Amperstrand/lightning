@@ -1810,6 +1810,13 @@ def test_pay_retry(node_factory, bitcoind, executor, chainparams):
         maxpay = chan['spendable_msat']
         lbl = ''.join(random.choice(string.ascii_letters) for _ in range(20))
         inv = peer.rpc.invoice(maxpay, lbl, "exhaust_channel")
+        # Strict-signer note (lightning-playground #270, the #268 EC-6
+        # pattern): raw sendpay never consults preapproval, so a
+        # validating signer refuses these payments as unregistered and
+        # the refusal kills channeld mid-retry, hanging the suite.
+        # Register the invoice on the payer via the production channel
+        # (what the pay plugin does automatically).
+        opener.rpc.preapproveinvoice(inv['bolt11'])
         routestep = {
             'amount_msat': maxpay,
             'id': peer.info['id'],

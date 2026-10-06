@@ -1220,6 +1220,17 @@ static const struct db_migration dbmigrations[] = {
 	 " WHERE funding_feerate = 0 OR funding_feerate IS NULL;"), NULL,
      /* Clamping is idempotent, so no revert needed */
      NULL, NULL},
+    /* Harness addition (#270 lineage, idempotent by 20c078d38 so it
+     * survives rebases): persist the last commitnum batch we sent, for
+     * the sent_commitsigs contract rails (wallet/test/run-sent_commitsigs.c). */
+    {SQL("CREATE TABLE IF NOT EXISTS sent_commitsigs ("
+	 "  channel_id BIGINT NOT NULL"
+	 ", commitnum BIGINT NOT NULL"
+	 ", batch BLOB"
+	 ", PRIMARY KEY (channel_id)"
+	 ")"),
+     NULL,
+     SQL("DROP TABLE sent_commitsigs"), NULL},
     /* ^v26.09 */
 };
 

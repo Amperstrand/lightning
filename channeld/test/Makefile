@@ -10,6 +10,17 @@ ALL_TEST_PROGRAMS += $(CHANNELD_TEST_PROGRAMS)
 # run-full_channel.o needs a special version of some common files!
 $(filter-out channeld/test/run-full_channel,$(CHANNELD_TEST_PROGRAMS)): libcommon.a
 
+# run-splice-fundee-balance #includes channeld.c (main() renamed), so it
+# needs channeld's own object set minus channeld.o itself, plus the hsmd
+# client wiregen the setup_channel message rides on.
+channeld/test/run-splice-fundee-balance:			\
+	$(filter-out channeld/channeld.o,$(CHANNELD_OBJS))	\
+	$(HSMD_CLIENT_OBJS)					\
+	$(BITCOIN_OBJS)						\
+	wire/towire.o						\
+	wire/fromwire.o					\
+	libcommon.a
+
 channeld/test/run-full_channel:			\
 	$(BITCOIN_OBJS)				\
 	wire/towire.o				\

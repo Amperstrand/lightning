@@ -389,6 +389,21 @@ static void open_abort(struct state *state,
 		tal_free(errmsg);
 }
 
+/* Fork #270: master can abort the open mid-roundtrip — a signer refusal
+ * delivered as an openchannel2_sign hook failure arrives here as
+ * dualopend_fail while we are synchronously waiting for the next
+ * protocol step. Fail the open (tx_abort to the peer) instead of
+ * master_badmsg-killing the daemon on the unexpected type. */
+static bool master_fail_aborts_open(struct state *state, const u8 *msg)
+{
+	wirestring *err;
+
+	if (!fromwire_dualopend_fail(tmpctx, msg, &err))
+		return false;
+	open_abort(state, "%s", err);
+	return true;
+}
+
 static void open_err_warn(struct state *state,
 			  const char *fmt, ...)
 {
@@ -2352,6 +2367,10 @@ static u8 *accepter_commits(struct state *state,
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
 
+	if (master_fail_aborts_open(state, msg)) {
+		*err_reason = NULL;
+		return NULL;
+	}
 	if (fromwire_peektype(msg) != WIRE_DUALOPEND_COMMIT_SEND_ACK)
 		master_badmsg(WIRE_DUALOPEND_COMMIT_SEND_ACK, msg);
 
@@ -2397,6 +2416,10 @@ static u8 *accepter_commits(struct state *state,
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
 
+	if (master_fail_aborts_open(state, msg)) {
+		*err_reason = NULL;
+		return NULL;
+	}
 	if (fromwire_peektype(msg) != WIRE_DUALOPEND_SEND_TX_SIGS)
 		master_badmsg(WIRE_DUALOPEND_SEND_TX_SIGS, msg);
 
@@ -3013,6 +3036,10 @@ static u8 *opener_commits(struct state *state,
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
 
+	if (master_fail_aborts_open(state, msg)) {
+		*err_reason = NULL;
+		return NULL;
+	}
 	if (fromwire_peektype(msg) != WIRE_DUALOPEND_COMMIT_SEND_ACK)
 		master_badmsg(WIRE_DUALOPEND_COMMIT_SEND_ACK, msg);
 

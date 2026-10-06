@@ -84,6 +84,9 @@ void channel_fail_transient(struct channel *channel UNNEEDED,
 			    bool disconnect UNNEEDED,
 			    const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "channel_fail_transient called!\n"); abort(); }
+/* Generated stub for channel_funding_spend_unresolved */
+bool channel_funding_spend_unresolved(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_funding_spend_unresolved called!\n"); abort(); }
 /* Generated stub for channel_gossip_channel_disconnect */
 void channel_gossip_channel_disconnect(struct channel *channel UNNEEDED)
 { fprintf(stderr, "channel_gossip_channel_disconnect called!\n"); abort(); }
