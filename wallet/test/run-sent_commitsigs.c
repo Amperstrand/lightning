@@ -529,6 +529,28 @@ static bool test_sent_commitsig_stale_row_is_inert(struct lightningd *ld)
 	return true;
 }
 
+
+/* Stubs for symbols master's wallet.c grew after this rail was written
+ * (v26.09-era watchman + invoice hooks). The rail never exercises them. */
+void watchman_watch_scriptpubkey(struct lightningd *ld UNNEEDED,
+				 const char *owner UNNEEDED,
+				 const u8 *scriptpubkey UNNEEDED,
+				 size_t script_len UNNEEDED,
+				 u32 start_block UNNEEDED)
+{ fprintf(stderr, "watchman_watch_scriptpubkey called!\n"); abort(); }
+void watchman_watch_outpoint(struct lightningd *ld UNNEEDED,
+			     const char *owner UNNEEDED,
+			     const struct bitcoin_outpoint *outpoint UNNEEDED,
+			     u32 start_block UNNEEDED)
+{ fprintf(stderr, "watchman_watch_outpoint called!\n"); abort(); }
+u32 get_block_height(const struct chain_topology *topo UNNEEDED)
+{ fprintf(stderr, "get_block_height called!\n"); abort(); }
+void invoice_check_onchain_payment(struct lightningd *ld UNNEEDED,
+				   const u8 *scriptPubKey UNNEEDED,
+				   struct amount_sat sat UNNEEDED,
+				   const struct bitcoin_outpoint *outpoint UNNEEDED)
+{ fprintf(stderr, "invoice_check_onchain_payment called!\n"); abort(); }
+
 int main(int argc, char *argv[])
 {
 	bool ok = true;
