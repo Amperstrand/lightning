@@ -95,7 +95,10 @@ def test_splice_stored_feerate_repaired_on_upgrade(node_factory, bitcoind,
     # Rewind past the two clamping migrations so they run again over the row
     # we just planted, which is the upgrade an attacked node goes through.
     # They are plain idempotent UPDATEs, so re-running them is safe.
-    l1.db_manip("UPDATE version SET version = version - 2")
+    # -3, not -2: this branch appends the harness sent_commitsigs
+    # migration AFTER the two clamping migrations, so rewinding past the
+    # clamps needs one extra step.
+    l1.db_manip("UPDATE version SET version = version - 3")
     l1.daemon.opts['database-upgrade'] = 'true'
     l1.start()
 
