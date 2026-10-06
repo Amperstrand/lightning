@@ -4097,13 +4097,57 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 	struct json_stream *response;
 	struct channel *channel;
 	struct bitcoin_tx *tx;
+	bool *unsigned_tx;
 
 	if (!param(cmd, buffer, params,
 		   p_req("id", param_dev_channel, &channel),
+		   p_opt("unsigned", param_bool, &unsigned_tx),
 		   NULL))
 		return command_param_failed();
 
+	if (unsigned_tx && *unsigned_tx && channel->last_tx == NULL)
+		return command_fail(cmd, LIGHTNINGD,
+				    "unsigned preview: no last_tx yet");
+
 	response = json_stream_success(cmd);
+
+	/* Txid-only preview (harness lineage 9f7fe1e66): the txid does not
+	 * depend on the witness, and asking the HSM for a real commitment
+	 * signature makes a strict signer treat the channel as closed
+	 * (BOLT #2: "SHOULD NOT sign commitment transactions, unless it's
+	 * about to broadcast them"). No witness serialization. */
+	if (unsigned_tx && *unsigned_tx) {
+		struct bitcoin_txid txid;
+
+		bitcoin_txid(channel->last_tx, &txid);
+		log_debug(channel->log, "dev-sign-last-tx: unsigned preview");
+		json_add_txid(response, "txid", &txid);
+		json_add_txid(response, "spends_txid",
+			      &channel->funding.txid);
+
+		if (!list_empty(&channel->inflights)) {
+			struct channel_inflight *inflight;
+
+			json_array_start(response, "inflights");
+			list_for_each(&channel->inflights, inflight, list) {
+				if (inflight->splice_locked_memonly)
+					continue;
+				if (inflight->last_tx != NULL) {
+					bitcoin_txid(inflight->last_tx, &txid);
+				} else {
+					memset(&txid, 0, sizeof(txid));
+				}
+				json_object_start(response, NULL);
+				json_add_txid(response, "funding_txid",
+					      &inflight->funding->outpoint.txid);
+				json_add_txid(response, "txid", &txid);
+				json_object_end(response);
+			}
+			json_array_end(response);
+		}
+		return command_success(cmd, response);
+	}
+
 	log_debug(channel->log, "dev-sign-last-tx: signing tx with %zu outputs",
 		  channel->last_tx->wtx->num_outputs);
 
@@ -4118,8 +4162,11 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 		list_for_each(&channel->inflights, inflight, list) {
 			if (inflight->splice_locked_memonly)
 				continue;
-			tx = sign_last_tx(cmd, channel, inflight->last_tx,
-					  &inflight->last_sig);
+			if (unsigned_tx)
+				tx = clone_bitcoin_tx(cmd, inflight->last_tx);
+			else
+				tx = sign_last_tx(cmd, channel, inflight->last_tx,
+						  &inflight->last_sig);
 			json_object_start(response, NULL);
 			json_add_txid(response, "funding_txid",
 				      &inflight->funding->outpoint.txid);
