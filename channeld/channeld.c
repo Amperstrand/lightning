@@ -6057,8 +6057,13 @@ static void peer_reconnect(struct peer *peer,
 			 * for messages that will never come, wedging the
 			 * channel in CHANNELD_AWAITING_SPLICE with an
 			 * inflight that can never confirm.  Drop it and
-			 * keep the channel instead. */
-			if (!inflight->i_am_initiator) {
+			 * keep the channel instead.  A fully-signed
+			 * inflight is NOT abandonment - the initiator then
+			 * simply has nothing to retransmit, and the
+			 * splice may confirm at any moment. */
+			if (!inflight->i_am_initiator
+			    && (!inflight->last_tx
+				|| !inflight->remote_tx_sigs)) {
 				status_info("Peer omitted next_funding and we"
 					    " are the splice accepter: peer has"
 					    " no live splice, aborting ours");
