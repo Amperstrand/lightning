@@ -154,6 +154,31 @@ static struct command_result * payment_start(struct payment *p)
 	return payment_continue(p);
 }
 
+static struct command_result *renepay_preapprove_done(struct command *cmd,
+						      const char *method,
+						      const char *buf,
+						      const jsmntok_t *result,
+						      struct payment *p)
+{
+	return payment_start(p);
+}
+
+/* pay and xpay run the invoice through preapproval before committing an
+ * outgoing HTLC; renepay did not. Register the invoice the same way
+ * before starting: the stock hsmd approves unconditionally, so behavior
+ * is unchanged there, while a decline (e.g. a remote validating signer's
+ * policy) fails the command instead of leaving the payment intent
+ * unregistered. */
+static struct command_result *renepay_preapprove_then_start(struct command *cmd,
+							    const char *invstr,
+							    struct payment *p)
+{
+	struct out_req *req = jsonrpc_request_start(
+	    cmd, "preapproveinvoice", &renepay_preapprove_done, forward_error, p);
+	json_add_string(req->js, "bolt11", invstr);
+	return send_outreq(req);
+}
+
 static struct command_result *json_renepay(struct command *cmd, const char *buf,
 					   const jsmntok_t *params)
 {
@@ -396,7 +421,7 @@ static struct command_result *json_renepay(struct command *cmd, const char *buf,
 		// good to go
 		payment = tal_steal(pay_plugin, payment);
 		payment_map_add(pay_plugin->payment_map, payment);
-		return payment_start(payment);
+		return renepay_preapprove_then_start(cmd, invstr, payment);
 	}
 
 	/* === Start or continue payment === */
@@ -430,7 +455,7 @@ static struct command_result *json_renepay(struct command *cmd, const char *buf,
 			return command_fail(cmd, PLUGIN_ERROR,
 					    "failed to register command");
 
-		return payment_start(payment);
+		return renepay_preapprove_then_start(cmd, invstr, payment);
 	}
 
 	// else: this payment is pending we continue its execution, we merge all
