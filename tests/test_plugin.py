@@ -6289,3 +6289,18 @@ def test_huge_log_entry(node_factory):
 
     # Still alive, and still answering.
     assert l1.rpc.getinfo()['id'] == l1.info['id']
+
+
+def test_plugin_uses_suite_pyln(node_factory):
+    """A `#!/usr/bin/env python3` plugin must resolve the suite's own pyln.
+
+    The plugin subprocess runs under the system python: without the
+    tree's packages on the daemon environment it either dies at
+    getmanifest (system python without pyln) or imports a foreign
+    installation — both wrong for a suite that ships its own pyln.
+    """
+    plugin_path = os.path.join(
+        os.path.dirname(__file__), 'plugins', 'pyln_env_check.py')
+    l1 = node_factory.get_node(options={'plugin': plugin_path})
+    tree_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert l1.rpc.getpylnpath()['path'].startswith(tree_root)
