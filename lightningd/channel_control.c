@@ -2070,29 +2070,46 @@ bool peer_start_channeld(struct channel *channel,
 			   NULL, channel->scid, 0, false,
 			   &txid)));
 
-	/* Replay the confirmed depth of any splice inflights.  Depth
+	/* Replay the confirmed depth of a splice inflight.  Depth
 	 * notifications that fired while the channel had no owner
 	 * (blocks processed during startup catch-up, before channeld
 	 * attached) were dropped: without this replay the freshly
 	 * attached channeld parks in CHANNELD_AWAITING_SPLICE until an
-	 * arbitrary next block re-fires the depth watch. */
-	list_for_each(&channel->inflights, inflight, list) {
-		u32 splice_depth;
+	 * arbitrary next block re-fires the depth watch.  Splice
+	 * channels only (dual-funding candidates are driven by
+	 * dualopend), and only when exactly one candidate is confirmed:
+	 * with several RBF candidates the confirmation bookkeeping
+	 * (which candidate's HTLC sigs become active) must come from
+	 * the watch machinery, not a synthetic replay. */
+	if (channel->state == CHANNELD_AWAITING_SPLICE) {
+		struct channel_inflight *confirmed = NULL;
+		size_t num_confirmed = 0;
 
-		if (!inflight->scid)
-			continue;
-		splice_depth = get_block_height(ld->topology)
-			- short_channel_id_blocknum(*inflight->scid);
+		list_for_each(&channel->inflights, inflight, list) {
+			if (!inflight->scid)
+				continue;
+			confirmed = inflight;
+			num_confirmed++;
+		}
 		log_debug(channel->log,
-			  "Replaying confirmed splice depth %u for txid %s",
-			  splice_depth,
-			  fmt_bitcoin_txid(tmpctx,
-					   &inflight->funding->outpoint.txid));
-		subd_send_msg(channel->owner,
-			      take(towire_channeld_funding_depth(
-				   NULL, inflight->scid, splice_depth,
-				   true,
-				   &inflight->funding->outpoint.txid)));
+			  "Attach replay check: state %s, %zu confirmed"
+			  " inflight(s)",
+			  channel_state_str(channel->state), num_confirmed);
+		if (num_confirmed == 1) {
+			u32 splice_depth = get_block_height(ld->topology)
+				- short_channel_id_blocknum(*confirmed->scid);
+			log_debug(channel->log,
+				  "Replaying confirmed splice depth %u for"
+				  " txid %s",
+				  splice_depth,
+				  fmt_bitcoin_txid(tmpctx,
+					   &confirmed->funding->outpoint.txid));
+			subd_send_msg(channel->owner,
+				      take(towire_channeld_funding_depth(
+					   NULL, confirmed->scid, splice_depth,
+					   true,
+					   &confirmed->funding->outpoint.txid)));
+		}
 	}
 	return true;
 }
