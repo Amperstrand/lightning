@@ -2823,6 +2823,142 @@ void channel_watch_inflight_outs(struct lightningd *ld, struct channel *channel)
 					 ld->topology, channel,
 					 &inflight->funding->outpoint,
 					 funding_spent));
+
+	channel_watch_inflight_inputs(ld, channel);
+}
+
+/* A confirmed spend of an input that an armed splice inflight also
+ * spends, by a transaction that is none of our inflights: the inflight
+ * can never confirm.  Tell channeld to abort the splice so the channel
+ * resolves on the original funding instead of wedging forever. */
+static enum watch_result inflight_input_spent(struct channel *channel,
+					       const struct bitcoin_tx *tx,
+					       size_t input_num,
+					       const struct block *block)
+{
+	struct bitcoin_txid txid;
+	struct bitcoin_outpoint outpoint;
+	struct channel_inflight *inflight;
+	bool dead = false;
+
+	bitcoin_txid(tx, &txid);
+
+	/* The spending tx being one of our own inflights is the normal
+	 * lockin path (this candidate or a competing one confirming). */
+	list_for_each(&channel->inflights, inflight, list) {
+		if (bitcoin_txid_eq(&txid, &inflight->funding->outpoint.txid))
+			return KEEP_WATCHING;
+	}
+
+	bitcoin_tx_input_get_outpoint(tx, input_num, &outpoint);
+
+	list_for_each(&channel->inflights, inflight, list) {
+		for (size_t i = 0; i < inflight->funding_psbt->num_inputs; i++) {
+			struct bitcoin_outpoint psbt_outpoint;
+
+			wally_psbt_input_get_outpoint(
+				&inflight->funding_psbt->inputs[i],
+				&psbt_outpoint);
+			if (bitcoin_outpoint_eq(&psbt_outpoint, &outpoint)) {
+				dead = true;
+				break;
+			}
+		}
+		if (dead)
+			break;
+	}
+
+	if (!dead)
+		return KEEP_WATCHING;
+
+	/* Only splice channels act here: channeld_abort is a channeld
+	 * message, and dual-funding candidates are driven by dualopend
+	 * (messaging or deleting them from under it corrupts its
+	 * candidate set - and crashes the daemon on the invalid
+	 * message). */
+	if (channel->state != CHANNELD_AWAITING_SPLICE)
+		return KEEP_WATCHING;
+
+	if (!channel->owner) {
+		/* Startup catch-up: no channeld to abort.  Drop the dead
+		 * inflight(s) now so the channel starts clean on the
+		 * original funding instead of re-wedging. */
+		struct channel_inflight *next;
+		list_for_each_safe(&channel->inflights, inflight, next, list) {
+			bool shares_input = false;
+
+			for (size_t i = 0;
+			     i < inflight->funding_psbt->num_inputs;
+			     i++) {
+				struct bitcoin_outpoint psbt_outpoint;
+
+				wally_psbt_input_get_outpoint(
+					&inflight->funding_psbt->inputs[i],
+					&psbt_outpoint);
+				if (bitcoin_outpoint_eq(&psbt_outpoint,
+							&outpoint)) {
+					shares_input = true;
+					break;
+				}
+			}
+			if (shares_input) {
+				/* destroy_inflight() unlinks on free. */
+				wallet_inflight_del(channel->peer->ld->wallet,
+						    channel, inflight);
+				tal_free(inflight);
+			}
+		}
+		/* Return to normal on the original funding: the splice
+		 * can never confirm. */
+		if (channel->state == CHANNELD_AWAITING_SPLICE)
+			channel_set_state(channel, CHANNELD_AWAITING_SPLICE,
+					  CHANNELD_NORMAL, REASON_LOCAL,
+					  "splice inflight inputs double-spent");
+		log_unusual(channel->log,
+			    "Splice inflight input %s was spent by conflicting"
+			    " transaction %s: dropped dead inflight(s) at"
+			    " startup",
+			    fmt_bitcoin_outpoint(tmpctx, &outpoint),
+			    fmt_bitcoin_txid(tmpctx, &txid));
+		return DELETE_WATCH;
+	}
+
+	/* A close already in flight spends the funding input too: the
+	 * splice is moot, nothing to abort. */
+	if (channel_state_closing(channel->state))
+		return DELETE_WATCH;
+
+	log_unusual(channel->log,
+		    "Splice inflight input %s was spent by conflicting"
+		    " transaction %s: aborting splice",
+		    fmt_bitcoin_outpoint(tmpctx, &outpoint),
+		    fmt_bitcoin_txid(tmpctx, &txid));
+	subd_send_msg(channel->owner,
+		      take(towire_channeld_abort(NULL)));
+
+	return DELETE_WATCH;
+}
+
+void channel_watch_inflight_inputs(struct lightningd *ld, struct channel *channel)
+{
+	struct channel_inflight *inflight;
+
+	tal_free(channel->inflight_input_watches);
+	channel->inflight_input_watches = tal_arr(channel, struct txowatch*, 0);
+
+	list_for_each(&channel->inflights, inflight, list) {
+		for (size_t i = 0; i < inflight->funding_psbt->num_inputs; i++) {
+			struct bitcoin_outpoint outpoint;
+
+			wally_psbt_input_get_outpoint(
+				&inflight->funding_psbt->inputs[i], &outpoint);
+			tal_arr_expand(&channel->inflight_input_watches,
+				       watch_txo(channel->inflight_input_watches,
+						 ld->topology, channel,
+						 &outpoint,
+						 inflight_input_spent));
+		}
+	}
 }
 
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)

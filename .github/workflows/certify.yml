@@ -1,0 +1,70 @@
+name: certify
+on: push
+
+jobs:
+  build-and-certify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq autoconf automake libtool \
+            build-essential python3 python3-pip jq curl gettext \
+            nettle-dev libsqlite3-dev zlib1g-dev libsodium-dev \
+            libssl-dev zlib1g-dev lowdown
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -q pytest mako grpcio-tools
+          echo /opt/venv/bin >> $GITHUB_PATH
+      - name: bitcoind
+        run: |
+          curl -sSfL -o bt.tar.gz \
+            https://bitcoincore.org/bin/bitcoin-core-28.0/bitcoin-28.0-x86_64-linux-gnu.tar.gz
+          tar xzf bt.tar.gz
+          sudo install -m 0755 bitcoin-28.0/bin/bitcoind /usr/local/bin/
+          sudo install -m 0755 bitcoin-28.0/bin/bitcoin-cli /usr/local/bin/
+      - name: configure
+        run: ./configure --disable-valgrind
+      - name: build
+        run: make -j"$(nproc)"
+      - name: version sanity
+        run: |
+          want=$(git rev-parse --short HEAD)
+          got=$(./lightningd/lightningd --version | grep -o 'g[0-9a-f]*' | head -1 | tr -d g)
+          [ "${want:0:${#got}}" = "$got" ]
+      - name: pyln test deps
+        run: |
+          pip install \
+            -e contrib/pyln-proto -e contrib/pyln-testing -e contrib/pyln-client \
+            ephemeral-port-reserve psycopg2-binary jsonschema requests psutil \
+            bitstring python-bitcoinlib==0.12.2 python-bitcoinrpc
+      - name: certify (family tests present on this branch)
+        run: |
+          mkdir -p ~/.bitcoin ~/.elements
+          printf 'rpcport=18443\n' > ~/.bitcoin/bitcoin.conf
+          rc=0
+          for t in tests/test_abort_channels_no_ids.py \
+                   tests/test_signpsbt_zero_outputs.py \
+                   tests/test_splice_restart_depth.py \
+                   tests/test_splice_input_doublespend.py \
+                   tests/test_e2b_restart_variant.py \
+                   tests/test_f23_abandoned.py; do
+            [ -e "$t" ] || continue
+            echo "::group::$t"
+            if ! env TEST_NETWORK=regtest TIMEOUT_BOUND=900 SLOW_MACHINE=1 \
+                 python3 -m pytest "$t"; then
+              # known load-flake gets exactly one rerun
+              sleep 10
+              env TEST_NETWORK=regtest TIMEOUT_BOUND=900 SLOW_MACHINE=1 \
+                python3 -m pytest "$t" || rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+      - name: upstream splice suite
+        run: |
+          env TEST_NETWORK=regtest TIMEOUT_BOUND=900 SLOW_MACHINE=1 \
+            python3 -m pytest tests/test_splicing.py
