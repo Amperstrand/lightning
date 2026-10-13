@@ -753,6 +753,23 @@ static void splice_found(struct lightningd *ld,
 			 splice_depth_cb,
 			 splice_reorged_cb,
 			 inflight);
+
+	/* Issue #310 follow-up: if the splice confirmed while we were down
+	 * (restart with an already-mined inflight), the depth event for the
+	 * blocks mined in the interim will NEVER fire — watch_check_block_added
+	 * only runs on NEW blocks (updates_complete requires tip != prev_tip).
+	 * Synthesize it now from the current tip so the resume path
+	 * (funding_depth -> splice_locked) proceeds without waiting for a
+	 * block that already happened. The watch stays armed for future
+	 * blocks and reorgs either way. */
+	if (get_block_height(ld->topology) >= loc->blkheight) {
+		u32 depth = get_block_height(ld->topology) - loc->blkheight + 1;
+		log_debug(inflight->channel->log,
+			  "splice_found: inflight already %u deep at restart, "
+			  "synthesizing funding_depth now (issue #310)",
+			  depth);
+		splice_depth_cb(ld, depth, inflight);
+	}
 }
 
 void watch_splice_inflight(struct lightningd *ld,
@@ -1409,6 +1426,33 @@ static void peer_channeld_reestablished(struct channel *channel, const u8* msg)
 				       tal_hex(channel, msg));
 
 	channel_gossip_channel_reestablished(channel, announcement_sigs_requested);
+
+	/* Issue #310 follow-up: channeld is now attached. If any splice
+	 * inflight is already confirmed (its scid was set during the
+	 * startup UTXO scan) but the depth events fired before channeld
+	 * existed, send the funding_depth now — the resume path
+	 * (funding_depth -> splice_locked -> NORMAL) would otherwise
+	 * wait for a block that already happened. */
+	if (channel->state == CHANNELD_AWAITING_SPLICE) {
+		struct channel_inflight *inflight;
+		list_for_each(&channel->inflights, inflight, list) {
+			if (inflight->scid && channel->owner) {
+				u32 tip_h = get_block_height(channel->peer->ld->topology);
+				u32 depth = tip_h >= short_channel_id_blocknum(*inflight->scid)
+					? tip_h - short_channel_id_blocknum(*inflight->scid) + 1
+					: 1;
+				log_debug(channel->log,
+					  "reestablished: replaying splice "
+					  "funding_depth for confirmed inflight "
+					  "(depth %u, issue #310)", depth);
+				subd_send_msg(channel->owner,
+					      take(towire_channeld_funding_depth(
+						       NULL, inflight->scid,
+						       depth, true,
+						       &inflight->funding->outpoint.txid)));
+			}
+		}
+	}
 }
 
 void channel_fallen_behind(struct channel *channel)
