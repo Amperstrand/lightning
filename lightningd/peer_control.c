@@ -1448,12 +1448,17 @@ static void connect_activate_subd(struct lightningd *ld, struct channel *channel
 	/* Startup reconciliation says the funding output is already spent:
 	 * never resume a dead channel.  The funding spend watch will move
 	 * it onchain once the spend confirms (or a chainview recovery
-	 * clears the gate and we reconnect). */
+	 * clears the gate and we reconnect).
+	 * Issue #307: a LOCAL deferral must never instruct a standard peer
+	 * to destroy the channel — a peer receiving ERROR for a live
+	 * channel force-closes it. Drop the connection silently; the peer
+	 * retries and reevaluation happens per attempt. */
 	if (channel_funding_spend_unresolved(channel)) {
-		error = towire_errorfmt(tmpctx, &channel->cid,
-					"Funding transaction spent: "
-					"awaiting onchain resolution");
-		goto send_error;
+		log_unusual(channel->log,
+			    "Funding spend unresolved: dropping peer "
+			    "connection without error (local deferral, "
+			    "issue #307)");
+		return NULL;
 	}
 
 	switch (channel->state) {
@@ -2176,12 +2181,14 @@ void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 		/* Funding already spent per startup reconciliation: never
 		 * resume this channel (channeld reestablish negotiation or
 		 * dualopend restart included); the funding spend watch is
-		 * taking it onchain. */
+		 * taking it onchain.
+		 * Issue #307: silent local drop — never ERROR the peer for
+		 * our own deferral state (peer would force-close). */
 		if (channel_funding_spend_unresolved(channel)) {
-			error = towire_errorfmt(tmpctx, &channel_id,
-						"Funding transaction spent: "
-						"awaiting onchain resolution");
-			goto send_error;
+			log_unusual(channel->log,
+				    "Funding spend unresolved: ignoring "
+				    "reestablish (local deferral, issue #307)");
+			return;
 		}
 
 		if (channel_state_wants_peercomms(channel->state)) {

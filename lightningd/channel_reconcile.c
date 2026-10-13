@@ -112,8 +112,27 @@ bool channel_funding_spend_unresolved(const struct channel *channel)
 	return channel->funding_spent_unresolved;
 }
 
+/* Issue #307: a channel with live splice inflights must not be gated —
+ * a confirmed/pending splice spends the OLD funding output by design
+ * (creating a new funding for the SAME channel), so getutxout == NULL
+ * on the old outpoint is EXPECTED mid-splice, not a close. The
+ * splice-aware spend watches (upstream funding_spent) own resolution
+ * for those; the gate defers to them. */
+static bool channel_has_inflights(const struct channel *channel)
+{
+	return !list_empty(&channel->inflights);
+}
+
 static void mark_funding_spent(struct channel *channel)
 {
+	if (channel_has_inflights(channel)) {
+		log_debug(channel->log,
+			  "reconcile: funding %s spent but channel has "
+			  "splice inflights — deferring to the splice "
+			  "watches (issue #307)",
+			  fmt_bitcoin_outpoint(tmpctx, &channel->funding));
+		return;
+	}
 	channel->funding_spent_unresolved = true;
 	log_unusual(channel->log,
 		    "Funding output %s is spent according to bitcoind: "
