@@ -139,7 +139,7 @@ void disconnect_peer(struct peer *peer)
 			status_peer_debug(&peer->id, "disconnect_peer: setting 5 second timer for subd %zu/%zu.",
 					  i, tal_count(peer->subds));
 			notleak(new_reltimer(&peer->daemon->timers, peer->subds[i],
-					     time_from_sec(5),
+					     time_from_sec(0),
 					     close_subd_timeout, peer->subds[i]));
 		} else {
 			/* We told lightningd that peer spoke, but it hasn't returned yet. */
@@ -1526,7 +1526,7 @@ static struct io_plan *read_body_from_peer_done(struct io_conn *peer_conn,
 	       subd->rcvd_tx_abort = true;
 	       /* In case it doesn't close by itself */
 	       notleak(new_reltimer(&peer->daemon->timers, subd,
-				    time_from_sec(5),
+				    time_from_sec(0),
 				    close_subd_timeout, subd));
        }
 
@@ -1639,7 +1639,7 @@ static void destroy_peer_conn(struct io_conn *peer_conn, struct peer *peer)
 		}
 		/* Wake the writers to subd: you have 5 seconds */
 		notleak(new_reltimer(&peer->daemon->timers,
-				     peer->subds[i], time_from_sec(5),
+				     peer->subds[i], time_from_sec(0),
 				     close_subd_timeout, peer->subds[i]));
 		io_wake(peer->subds[i]->outq);
 	}
