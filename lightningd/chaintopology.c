@@ -1143,6 +1143,30 @@ static void try_extend_tip(struct chain_topology *topo)
 				     get_new_block, topo);
 }
 
+static struct command_result *json_syncblocks(struct command *cmd,
+					      const char *buffer,
+					      const jsmntok_t *obj UNNEEDED,
+					      const jsmntok_t *params)
+{
+	struct chain_topology *topo = cmd->ld->topology;
+
+	if (!param(cmd, buffer, params, NULL))
+		return command_param_failed();
+
+	if (topo->extend_timer) {
+		topo->extend_timer = tal_free(topo->extend_timer);
+		try_extend_tip(topo);
+	}
+
+	return command_success(cmd, json_stream_success(cmd));
+}
+
+static const struct json_command syncblocks_command = {
+	"syncblocks",
+	json_syncblocks,
+};
+AUTODATA(json_command, &syncblocks_command);
+
 u32 get_block_height(const struct chain_topology *topo)
 {
 	return topo->tip->height;
@@ -1307,7 +1331,7 @@ struct chain_topology *new_topology(struct lightningd *ld, struct logger *log)
 	topo->blockdepthwatches = new_htable(topo, blockdepthwatch_hash);
 	topo->log = log;
 	topo->bitcoind = new_bitcoind(topo, ld, log);
-	topo->poll_seconds = 30;
+	topo->poll_seconds = 2;
 	memset(topo->feerates, 0, sizeof(topo->feerates));
 	topo->smoothed_feerates = NULL;
 	topo->root = NULL;
