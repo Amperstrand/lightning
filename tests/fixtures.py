@@ -13,6 +13,39 @@ import tempfile
 import time
 
 
+def _vls_arm():
+    """vls-hsmd VLS_MODE pattern (test-only, applied as a patch by
+    splice-dev/mode-c): the arm switch lives in the fixtures, not in
+    launcher scripts. cln:native forces stock hsmd even if SUBDAEMON
+    leaked into the env; cln:socket routes hsmd through $SUBDAEMON."""
+    mode = os.environ.get('VLS_MODE') or (
+        'cln:socket' if os.environ.get('SUBDAEMON') else 'cln:native')
+    if mode not in ('cln:native', 'cln:socket'):
+        raise ValueError(
+            f"VLS_MODE={mode!r}: expected 'cln:native' or 'cln:socket'")
+    return mode
+
+
+VLS_ARM = _vls_arm()
+# The banner is the machine-checkable arm signature every run log
+# carries; splice-dev/bin/verify-arm.sh fails a run whose log contradicts
+# the declared arm.
+print(f"VLS ARM: {VLS_ARM} "
+      + ("(VLS signer via SUBDAEMON)" if VLS_ARM == 'cln:socket'
+         else "(stock hsmd; SUBDAEMON ignored)"), flush=True)
+
+
+@pytest.fixture(autouse=True)
+def vls_bitcoind_url(bitcoind):
+    # VLS import-farm: the proxy's chain follower needs a reachable
+    # bitcoind RPC; point it at this test run's bitcoind (pyln's fixed
+    # rpcuser/rpcpass creds) whenever the socket arm is routing.
+    if VLS_ARM == 'cln:socket' and os.environ.get("SUBDAEMON"):
+        os.environ['BITCOIND_RPC_URL'] = \
+            f"http://rpcuser:rpcpass@127.0.0.1:{bitcoind.rpcport}"
+    yield
+
+
 @pytest.fixture
 def node_cls():
     return LightningNode
@@ -24,6 +57,24 @@ class LightningNode(utils.LightningNode):
         # something in out path.
         kwargs["executable"] = "lightningd/lightningd"
         utils.LightningNode.__init__(self, *args, **kwargs)
+
+        # VLS import-farm (vls-hsmd Makefile pattern): route every node's
+        # hsmd through $SUBDAEMON on the socket arm; native arm ignores a
+        # leaked SUBDAEMON. TEST-ONLY wiring (mode-C demo): with the stock
+        # --subdaemon flag this is the ONLY change needed for a validating
+        # signer to serve an unmodified lightningd.
+        subdaemon = os.environ.get("SUBDAEMON")
+        if subdaemon and VLS_ARM == 'cln:socket':
+            self.daemon.opts['subdaemon'] = subdaemon
+
+        # mode-C demo (test-only): optionally load the interceptor plugin
+        # into every node — VLS_POLICY_PLUGIN=/path/to/vls-policy.py
+        plugin = os.environ.get("VLS_POLICY_PLUGIN")
+        if plugin and VLS_ARM == 'cln:socket':
+            self.daemon.opts['plugin={}'.format(plugin)] = None
+            knob = os.environ.get("VLS_POLICY_MAX_PAY_MSAT")
+            if knob:
+                self.daemon.opts['vls-policy-max-pay-msat'] = knob
 
         # Avoid socket path name too long on Linux
         if os.uname()[0] == 'Linux' and \
