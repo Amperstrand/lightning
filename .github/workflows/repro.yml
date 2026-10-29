@@ -1,5 +1,10 @@
 ---
 # https://docs.corelightning.org/docs/repro
+#
+# RUNNER POLICY (2026-10-29, Amperstrand/ops#43): self-hosted only with a
+# secret-free availability probe — no legion/ai-legion heartbeat within
+# 24h => the legs SKIP (neutral) instead of burning ~75 hosted minutes;
+# heartbeat => they run on the org fleet (docker-based builds, 20 cores).
 name: Repro Build Nightly
 on:
   # 05:00 Berlin, 03:00 UTC, 23:00 New York, 20:00 Los Angeles
@@ -8,9 +13,73 @@ on:
   workflow_dispatch:
 
 jobs:
+  pick-runner:
+    name: pick runner (self-hosted-only)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      lane: ${{ steps.pick.outputs.lane }}
+    steps:
+      - name: Probe fleet availability (secret-free)
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Availability = a job executed on a legion/ai-legion runner within
+          # 24h (machine-class heartbeat; the runners API is admin-only to
+          # job tokens). Own repo first; the kali-live-headless CI lane
+          # bootstraps the signal for first-time repos.
+          cutoff=$(date -u -d '24 hours ago' +%s)
+          case "$cutoff" in ''|*[!0-9]*) echo "::error::bad cutoff"; exit 1 ;; esac
+          saw_fleet() {
+            local repo=$1 pages=$2 runs run verdict
+            runs=$(gh api "repos/$repo/actions/runs?per_page=$pages" \
+              --jq ".workflow_runs[]
+                    | select(.status == \"completed\")
+                    | select((.updated_at | fromdateiso8601) > $cutoff)
+                    | .id" 2>&1) || {
+              echo "::notice::probe $repo listing failed: $(printf '%s' "$runs" | tail -1)"
+              return 1
+            }
+            for run in $runs; do
+              verdict=$(gh api "repos/$repo/actions/runs/$run/jobs" \
+                --jq 'any(.jobs[]; ((.runner_name // "") | (startswith("legion-") or startswith("ai-legion"))))' 2>/dev/null || true)
+              if [ "$verdict" = true ]; then
+                echo "::notice::probe $repo: run $run executed on a fleet runner"
+                return 0
+              fi
+            done
+            echo "::notice::probe $repo: no fleet runner within 24h"
+            return 1
+          }
+          if saw_fleet "${{ github.repository }}" 15 \
+             || saw_fleet Amperstrand/kali-live-headless 5; then
+            echo 'lane=selfhosted' >> "$GITHUB_OUTPUT"
+          else
+            echo 'lane=hosted' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Lane summary
+        run: |
+          {
+            echo "## Repro lane"
+            echo '```'
+            if [ "${{ steps.pick.outputs.lane }}" = selfhosted ]; then
+              echo "lane: self-hosted (org fleet)"
+            else
+              echo "legs: SKIPPED — self-hosted-only policy, no fleet heartbeat within 24h (Amperstrand/ops#43)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ubuntu:
     name: "Ubuntu repro build: ${{ matrix.version }}"
-    runs-on: ubuntu-22.04
+    needs: pick-runner
+    if: needs.pick-runner.outputs.lane == 'selfhosted'
+    runs-on: [self-hosted, legion-vm]
+    # docker-heavy repro builds vary; bound the leg and the queue race
+    timeout-minutes: 90
     strategy:
       fail-fast: false    # Let each build finish.
       matrix:
