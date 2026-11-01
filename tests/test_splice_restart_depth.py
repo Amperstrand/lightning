@@ -13,10 +13,16 @@ the confirmed depth immediately: the splice locks with no further
 blocks.
 """
 from fixtures import *  # noqa: F401,F403
+from fixtures import TEST_NETWORK
+import unittest
 from utils import wait_for, only_one
 import time
 
 
+@unittest.skipIf(TEST_NETWORK == "liquid-regtest",
+                 "splice depth-replay flow: txprepare cannot parse "
+                 "liquid blinded destination addresses "
+                 "(liquid Full Integration CI evidence, 2026-11-01)")
 def test_splice_restart_before_depth_processing(node_factory, bitcoind):
     nopts = {"disable-plugin": ["cln-currencyrate"],
              "may_reconnect": True,

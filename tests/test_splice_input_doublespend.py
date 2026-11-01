@@ -13,10 +13,16 @@ channeld aborts the dead splice; an already-signed splice force-closes,
 resolving the channel on-chain on the original funding.
 """
 from fixtures import *  # noqa: F401,F403
+from fixtures import TEST_NETWORK
+import unittest
 from utils import only_one, wait_for
 import time
 
 
+@unittest.skipIf(TEST_NETWORK == "liquid-regtest",
+                 "splice input double-spend flow: txprepare cannot parse "
+                 "liquid blinded destination addresses "
+                 "(liquid Full Integration CI evidence, 2026-11-01)")
 def test_splice_input_doublespend(node_factory, bitcoind):
     nopts = {"disable-plugin": ["cln-currencyrate"],
              "may_reconnect": True}

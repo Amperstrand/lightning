@@ -4,10 +4,16 @@ topology catch-up should fire the inflight-input watcher and abort the
 dead splice instead of re-wedging.
 """
 from fixtures import *  # noqa: F401,F403
+from fixtures import TEST_NETWORK
+import unittest
 from utils import only_one, wait_for
 import time
 
 
+@unittest.skipIf(TEST_NETWORK == "liquid-regtest",
+                 "splice double-spend restart flow: txprepare cannot parse "
+                 "liquid blinded destination addresses "
+                 "(liquid Full Integration CI evidence, 2026-11-01)")
 def test_e2b_restart_during_conflict(node_factory, bitcoind):
     nopts = {"disable-plugin": ["cln-currencyrate"]}
     l1, l2 = node_factory.get_nodes(2, opts=[nopts, nopts])
