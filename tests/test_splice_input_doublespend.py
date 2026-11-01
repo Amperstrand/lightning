@@ -99,7 +99,6 @@ def test_splice_input_doublespend(node_factory, bitcoind):
             pass
         time.sleep(1)
     assert inflight, "no inflight registered"
-    splice_txid = inflight["funding_txid"]
 
     # Double-spend the wallet input: unreserve it, then out-fee the
     # splice with a conflict (RBF rule 3).
