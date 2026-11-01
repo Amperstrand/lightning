@@ -2893,6 +2893,7 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 		struct channel_inflight *next;
 		bool first = true;
 		bool any_viable_splice = false;
+		bool retained_signed = false;
 		list_for_each_safe(&channel->inflights, inflight, next, list) {
 			bool shares_input = inflight_shares_input(inflight,
 								  &outpoint);
@@ -2912,12 +2913,7 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 					 * Retain it; it can never
 					 * confirm, but stays recorded.
 					 * Codex P1 on #7. */
-					log_unusual(channel->log,
-						    "Retaining signed dead"
-						    " inflight %s at startup"
-						    " cleanup",
-						    fmt_bitcoin_txid(tmpctx,
-							     &inflight->funding->outpoint.txid));
+					retained_signed = true;
 				} else {
 					/* destroy_inflight() unlinks on
 					 * free. */
@@ -2931,6 +2927,11 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 			 * splice candidate: not deleted, not viable. */
 			first = false;
 		}
+		if (retained_signed)
+			log_unusual(channel->log,
+				    "Retaining signed dead inflight(s)"
+				    " at startup cleanup (conflict %s)",
+				    fmt_bitcoin_txid(tmpctx, &txid));
 		/* Return to normal on the original funding only when no
 		 * viable splice candidate remains: the dead ones can
 		 * never confirm, but a candidate on different inputs
