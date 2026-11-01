@@ -2827,6 +2827,22 @@ void channel_watch_inflight_outs(struct lightningd *ld, struct channel *channel)
 	channel_watch_inflight_inputs(ld, channel);
 }
 
+/* Does this inflight's PSBT spend the given outpoint? */
+static bool inflight_shares_input(struct channel_inflight *inflight,
+				  const struct bitcoin_outpoint *outpoint)
+{
+	for (size_t i = 0; i < inflight->funding_psbt->num_inputs; i++) {
+		struct bitcoin_outpoint psbt_outpoint;
+
+		wally_psbt_input_get_outpoint(
+			&inflight->funding_psbt->inputs[i],
+			&psbt_outpoint);
+		if (bitcoin_outpoint_eq(&psbt_outpoint, outpoint))
+			return true;
+	}
+	return false;
+}
+
 /* A confirmed spend of an input that an armed splice inflight also
  * spends, by a transaction that is none of our inflights: the inflight
  * can never confirm.  Tell channeld to abort the splice so the channel
@@ -2853,19 +2869,10 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 	bitcoin_tx_input_get_outpoint(tx, input_num, &outpoint);
 
 	list_for_each(&channel->inflights, inflight, list) {
-		for (size_t i = 0; i < inflight->funding_psbt->num_inputs; i++) {
-			struct bitcoin_outpoint psbt_outpoint;
-
-			wally_psbt_input_get_outpoint(
-				&inflight->funding_psbt->inputs[i],
-				&psbt_outpoint);
-			if (bitcoin_outpoint_eq(&psbt_outpoint, &outpoint)) {
-				dead = true;
-				break;
-			}
-		}
-		if (dead)
+		if (inflight_shares_input(inflight, &outpoint)) {
+			dead = true;
 			break;
+		}
 	}
 
 	if (!dead)
@@ -2884,33 +2891,52 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 		 * inflight(s) now so the channel starts clean on the
 		 * original funding instead of re-wedging. */
 		struct channel_inflight *next;
+		bool first = true;
+		bool any_viable_splice = false;
 		list_for_each_safe(&channel->inflights, inflight, next, list) {
-			bool shares_input = false;
-
-			for (size_t i = 0;
-			     i < inflight->funding_psbt->num_inputs;
-			     i++) {
-				struct bitcoin_outpoint psbt_outpoint;
-
-				wally_psbt_input_get_outpoint(
-					&inflight->funding_psbt->inputs[i],
-					&psbt_outpoint);
-				if (bitcoin_outpoint_eq(&psbt_outpoint,
-							&outpoint)) {
-					shares_input = true;
-					break;
+			bool shares_input = inflight_shares_input(inflight,
+								  &outpoint);
+			if (!first && !shares_input) {
+				/* Another RBF candidate on different inputs
+				 * can still confirm: keep the channel in
+				 * AWAITING_SPLICE for it.  Codex P1 on #7. */
+				any_viable_splice = true;
+			} else if (shares_input && !first) {
+				if (inflight->i_sent_sigs) {
+					/* The peer may hold our sigs for
+					 * this candidate: dropping the
+					 * record breaks the revocation
+					 * invariants (same refusal as
+					 * maybe_cleanup_last_inflight
+					 * and channeld splice_abort).
+					 * Retain it; it can never
+					 * confirm, but stays recorded.
+					 * Codex P1 on #7. */
+					log_unusual(channel->log,
+						    "Retaining signed dead"
+						    " inflight %s at startup"
+						    " cleanup",
+						    fmt_bitcoin_txid(tmpctx,
+							     &inflight->funding->outpoint.txid));
+				} else {
+					/* destroy_inflight() unlinks on
+					 * free. */
+					wallet_inflight_del(
+						channel->peer->ld->wallet,
+						channel, inflight);
+					tal_free(inflight);
 				}
 			}
-			if (shares_input) {
-				/* destroy_inflight() unlinks on free. */
-				wallet_inflight_del(channel->peer->ld->wallet,
-						    channel, inflight);
-				tal_free(inflight);
-			}
+			/* The original funding (first entry) is never a
+			 * splice candidate: not deleted, not viable. */
+			first = false;
 		}
-		/* Return to normal on the original funding: the splice
-		 * can never confirm. */
-		if (channel->state == CHANNELD_AWAITING_SPLICE)
+		/* Return to normal on the original funding only when no
+		 * viable splice candidate remains: the dead ones can
+		 * never confirm, but a candidate on different inputs
+		 * still can.  Codex P1 on #7. */
+		if (channel->state == CHANNELD_AWAITING_SPLICE
+		    && !any_viable_splice)
 			channel_set_state(channel, CHANNELD_AWAITING_SPLICE,
 					  CHANNELD_NORMAL, REASON_LOCAL,
 					  "splice inflight inputs double-spent");
@@ -2927,6 +2953,29 @@ static enum watch_result inflight_input_spent(struct channel *channel,
 	 * splice is moot, nothing to abort. */
 	if (channel_state_closing(channel->state))
 		return DELETE_WATCH;
+
+	/* channeld applies abort to last_inflight() only: send it only
+	 * when THAT candidate is the dead one.  When the conflict kills
+	 * an earlier candidate, an abort here would kill the wrong (and
+	 * possibly the only viable) splice; channeld's own RBF
+	 * bookkeeping drops dead candidates it observes.  Codex P1 on
+	 * #7. */
+	{
+		struct channel_inflight *last;
+
+		last = list_tail(&channel->inflights,
+				 struct channel_inflight, list);
+		if (!last || !inflight_shares_input(last, &outpoint)) {
+			log_unusual(channel->log,
+				    "Splice inflight input %s was spent by"
+				    " conflicting transaction %s: earlier"
+				    " candidate is dead, last inflight"
+				    " unaffected - not aborting",
+				    fmt_bitcoin_outpoint(tmpctx, &outpoint),
+				    fmt_bitcoin_txid(tmpctx, &txid));
+			return DELETE_WATCH;
+		}
+	}
 
 	log_unusual(channel->log,
 		    "Splice inflight input %s was spent by conflicting"

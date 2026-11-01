@@ -2096,8 +2096,15 @@ bool peer_start_channeld(struct channel *channel,
 			  " inflight(s)",
 			  channel_state_str(channel->state), num_confirmed);
 		if (num_confirmed == 1) {
+			/* Depth counts the confirmation block itself (the
+			 * funding-depth convention: tip_height - conf_height
+			 * + 1).  Without the +1, a splice at exactly
+			 * minimum_depth confirmations replays as
+			 * minimum_depth - 1 and channeld discards it as
+			 * insufficient.  Codex P1 on #7. */
 			u32 splice_depth = get_block_height(ld->topology)
-				- short_channel_id_blocknum(*confirmed->scid);
+				- short_channel_id_blocknum(*confirmed->scid)
+				+ 1;
 			log_debug(channel->log,
 				  "Replaying confirmed splice depth %u for"
 				  " txid %s",

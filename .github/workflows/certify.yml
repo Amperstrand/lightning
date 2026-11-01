@@ -7,6 +7,11 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Codex P1 on #7: external/libwally-core, jsmn, gheap and
+          # libbacktrace are submodules - external/Makefile needs their
+          # headers and libraries; a bare checkout cannot build.
+          submodules: recursive
       - name: uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
       - name: deps
