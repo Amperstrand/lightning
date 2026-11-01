@@ -723,6 +723,10 @@ bool wallet_init_channels(struct wallet *w UNNEEDED)
 /* Generated stub for wallet_inflight_del */
 void wallet_inflight_del(struct wallet *w UNNEEDED, const struct channel *chan UNNEEDED, const struct channel_inflight *inflight UNNEEDED)
 { fprintf(stderr, "wallet_inflight_del called!\n"); abort(); }
+
+/* Generated stub for towire_channeld_abort */
+u8 *towire_channeld_abort(const tal_t *ctx UNNEEDED)
+{ fprintf(stderr, "towire_channeld_abort called!\n"); abort(); }
 /* Generated stub for wallet_insert_funding_spend */
 void wallet_insert_funding_spend(struct wallet *w UNNEEDED,
 				 const struct channel *chan UNNEEDED,
