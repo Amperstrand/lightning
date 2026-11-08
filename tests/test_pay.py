@@ -497,6 +497,38 @@ def test_pay_maxfee_shadow(node_factory):
         assert pay_status["amount_msat"] == Millisatoshi(amount)
 
 
+def test_sendpay_duplicate_no_onion_rebuild(node_factory):
+    """A duplicate sendpay (same hash, after completion) must not rebuild the
+    sphinx onion: the idempotency check answers from the payment DB first.
+    The debug line 'sendpay: building onion for' fires exactly once per
+    onion construction in send_payment() — once for the real payment, zero
+    for the duplicate. (Pins the pre-fix behavior where the duplicate
+    recomputed per-hop ECDH for the whole route before being told it had
+    already succeeded.)"""
+    l1, l2 = node_factory.line_graph(2, fundamount=10**6,
+                                     opts={'log-level': 'debug'})
+
+    amt = 200000000
+    inv = l2.rpc.invoice(amt, 'dup-onion-test', 'desc')
+    rhash = inv['payment_hash']
+    rs = {'amount_msat': amt, 'id': l2.info['id'], 'delay': 5,
+          'channel': first_scid(l1, l2)}
+
+    l1.rpc.sendpay([rs], rhash, payment_secret=inv['payment_secret'])
+    l1.rpc.waitsendpay(rhash)
+    assert l2.rpc.listinvoices('dup-onion-test')['invoices'][0]['status'] == 'paid'
+
+    # Duplicate sendpay with identical params after completion: the
+    # idempotent-success path — must not construct a second onion.
+    l1.rpc.sendpay([rs], rhash, payment_secret=inv['payment_secret'])
+
+    l1.daemon.logs_catchup()
+    builds = sum(1 for l in l1.daemon.logs
+                 if 'sendpay: building onion for' in l)
+    assert builds == 1, \
+        "duplicate sendpay rebuilt the sphinx onion: %d builds" % builds
+
+
 def test_sendpay(node_factory):
     l1, l2 = node_factory.line_graph(2, fundamount=10**6)
 

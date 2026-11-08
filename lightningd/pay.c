@@ -1218,6 +1218,10 @@ send_payment(struct lightningd *ld,
 	for (i = 0; i < n_hops; i++)
 		ids[i] = route[i].node_id;
 
+	/* We are actually building the onion now (past any idempotency
+	 * short-circuit): one debug line per real construction. */
+	log_debug(ld->log, "sendpay: building onion for %zu hops", n_hops);
+
 	/* Create sphinx path */
 	for (i = 0; i < n_hops - 1; i++) {
 		ret = pubkey_from_node_id(&pubkey, &ids[i]);
