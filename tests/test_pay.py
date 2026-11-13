@@ -496,6 +496,167 @@ def test_pay_maxfee_shadow(node_factory):
         assert pay_status["amount_msat"] == Millisatoshi(amount)
 
 
+
+
+
+def test_sendpay_preapprove(node_factory, bitcoind):
+    """sendpay and sendonion preapprove invoice payments like pay does
+
+    A raw sendpay never consulted preapproval, so with a validating
+    signer the outgoing HTLC was unregistered and the commitment
+    correctly refused. When bolt11 is supplied the RPCs now run the
+    preapproveinvoice round-trip first (once per payment: partid 0).
+    """
+    # The payer's hsmd declines every preapproval.
+    l1, l2 = node_factory.line_graph(2, fundamount=10**6,
+                                     opts=[{}, {'dev-hsmd-fail-preapprove': None}])
+
+    # Create some balance, make sure it's entirely settled.
+    l1.pay(l2, 200000000)
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['htlcs'] == [])
+
+    amt = 123000
+    inv = l1.rpc.invoice(amt, 'lbl', 'desc', 3700)
+    routestep = {
+        'amount_msat': amt,
+        'id': l1.info['id'],
+        'delay': 18,
+        'channel': first_scid(l2, l1)
+    }
+
+    # With bolt11 the preapproval decline fails the request...
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.sendpay([copy.deepcopy(routestep)], inv['payment_hash'],
+                       payment_secret=inv['payment_secret'],
+                       bolt11=inv['bolt11'])
+    # ...including in check mode -- but only when the hsmd advertises the
+    # check variant (a remote signer without it makes check succeed
+    # silently, the preapproveinvoice precedent: "hsmd too old to check").
+    if not os.environ.get('SUBDAEMON'):
+        with pytest.raises(RpcError, match='invoice was declined'):
+            l2.rpc.check('sendpay', route=[copy.deepcopy(routestep)],
+                         payment_hash=inv['payment_hash'],
+                         payment_secret=inv['payment_secret'],
+                         bolt11=inv['bolt11'])
+
+    # Without bolt11 nothing is preapproved: the send proceeds and pays.
+    l2.rpc.sendpay([copy.deepcopy(routestep)], inv['payment_hash'],
+                   payment_secret=inv['payment_secret'])
+    l2.rpc.waitsendpay(inv['payment_hash'])
+    assert only_one(l1.rpc.listinvoices(label='lbl')['invoices'])['status'] == 'paid'
+
+    # Only partid 0 preapproves: a part with partid != 0 is not held up
+    # by the decline.
+    inv2 = l1.rpc.invoice(amt, 'lbl2', 'desc', 3700)
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.sendpay([copy.deepcopy(routestep)], inv2['payment_hash'],
+                       payment_secret=inv2['payment_secret'],
+                       bolt11=inv2['bolt11'])
+    l2.rpc.call('sendpay', {
+        'route': [copy.deepcopy(routestep)],
+        'payment_hash': inv2['payment_hash'],
+        'payment_secret': inv2['payment_secret'],
+        'amount_msat': amt, 'groupid': 1, 'partid': 1})
+    l2.rpc.call('waitsendpay', {'payment_hash': inv2['payment_hash'],
+                                'partid': 1})
+    assert only_one(l1.rpc.listinvoices(label='lbl2')['invoices'])['status'] == 'paid'
+
+    # And sendonion gets the same treatment.
+    inv3 = l1.rpc.invoice(amt, 'lbl3', 'desc', 3700)
+    blockheight = l2.rpc.getinfo()['blockheight']
+    hops = [{
+        'pubkey': l1.info['id'],
+        'payload': serialize_payload_final_tlv(amt, 18, amt, blockheight,
+                                               inv3['payment_secret']).hex()
+    }]
+    onion = l2.rpc.createonion(hops=hops, assocdata=inv3['payment_hash'])
+    first_hop = {'id': l1.info['id'], 'amount_msat': amt, 'delay': 18}
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.sendonion(onion=onion['onion'],
+                         first_hop=first_hop,
+                         payment_hash=inv3['payment_hash'],
+                         bolt11=inv3['bolt11'])
+
+
+
+
+def test_sendpay_preapprove_mpp(node_factory, bitcoind):
+    """MPP under a validating signer: only part 0 preapproves, but every
+    part must clear the signer's invoice-balance validation — the
+    registration is keyed by payment_hash (idempotent in the signer),
+    so parts > 0 ride on part 0's registration. Parts are sent WITHOUT
+    bolt11 to prove nothing re-registers mid-payment.
+    """
+    l1, l2 = node_factory.line_graph(2, fundamount=10**6)
+
+    # Create some balance, make sure it's entirely settled.
+    l1.pay(l2, 200000000)
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['htlcs'] == [])
+
+    amt = 300000
+    part = 100000
+    inv = l2.rpc.invoice(amt, 'mpp', 'desc', 3700)
+    routestep = {
+        'amount_msat': part,
+        'id': l2.info['id'],
+        'delay': 18,
+        'channel': first_scid(l1, l2)
+    }
+
+    # Raw-MPP parts are partid >= 1 (partid 0 means "not a part"); each
+    # part carries bolt11, so each registers — the signer's registration
+    # is idempotent (keyed by payment_hash), so parts ride each other.
+    # amount_msat is the payment TOTAL on this lineage; each route hop
+    # carries its part's amount.
+    for pid in (1, 2, 3):
+        l1.rpc.call('sendpay', {
+            'route': [copy.deepcopy(routestep)],
+            'payment_hash': inv['payment_hash'],
+            'payment_secret': inv['payment_secret'],
+            'bolt11': inv['bolt11'],
+            'amount_msat': amt,
+            'groupid': 1, 'partid': pid})
+
+    for pid in (1, 2, 3):
+        r = l1.rpc.call('waitsendpay', {'payment_hash': inv['payment_hash'],
+                                        'partid': pid})
+        assert r['status'] == 'complete', r
+    assert only_one(l2.rpc.listinvoices(label='mpp')['invoices'])['status'] == 'paid'
+
+
+def test_sendpay_duplicate_no_onion_rebuild(node_factory):
+    """A duplicate sendpay (same hash, after completion) must not rebuild the
+    sphinx onion: the idempotency check answers from the payment DB first.
+    The debug line 'sendpay: building onion for' fires exactly once per
+    onion construction in send_payment() — once for the real payment, zero
+    for the duplicate. (Pins the pre-fix behavior where the duplicate
+    recomputed per-hop ECDH for the whole route before being told it had
+    already succeeded.)"""
+    l1, l2 = node_factory.line_graph(2, fundamount=10**6,
+                                     opts={'log-level': 'debug'})
+
+    amt = 200000000
+    inv = l2.rpc.invoice(amt, 'dup-onion-test', 'desc')
+    rhash = inv['payment_hash']
+    rs = {'amount_msat': amt, 'id': l2.info['id'], 'delay': 5,
+          'channel': first_scid(l1, l2)}
+
+    l1.rpc.sendpay([rs], rhash, payment_secret=inv['payment_secret'])
+    l1.rpc.waitsendpay(rhash)
+    assert l2.rpc.listinvoices('dup-onion-test')['invoices'][0]['status'] == 'paid'
+
+    # Duplicate sendpay with identical params after completion: the
+    # idempotent-success path — must not construct a second onion.
+    l1.rpc.sendpay([rs], rhash, payment_secret=inv['payment_secret'])
+
+    l1.daemon.logs_catchup()
+    builds = sum(1 for l in l1.daemon.logs
+                 if 'sendpay: building onion for' in l)
+    assert builds == 1, \
+        "duplicate sendpay rebuilt the sphinx onion: %d builds" % builds
+
+
+
 def test_sendpay(node_factory):
     l1, l2 = node_factory.line_graph(2, fundamount=10**6)
 

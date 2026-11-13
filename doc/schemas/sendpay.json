@@ -358,6 +358,7 @@
     "- 203: Permanent failure at destination. The *data* field of the error will be routing failure object.",
     "- 204: Failure along route; retry a different route. The *data* field of the error will be routing failure object.",
     "- 212: *localinvreqid* refers to an invalid, or used, local invoice_request.",
+    "- 213: The invoice was declined by the signer's preapproval (only possible when *bolt11* is supplied; see lightning-preapproveinvoice(7)).",
     "",
     "A routing failure object has the fields below:",
     "",
@@ -365,7 +366,10 @@
     "*erring_node*: The hex string of the pubkey id of the node that reported the error.",
     "*erring_channel*: The short channel ID of the channel that has the error, or *0:0:0* if the destination node raised the error. In addition *erring_direction* will indicate which direction of the channel caused the failure.",
     "*failcode*: The failure code, as per BOLT #4.",
-    "*channel_update*: The hex string of the *channel_update* message received from the remote node. Only present if error is from the remote node and the *failcode* has the UPDATE bit set, as per BOLT #4."
+
+    "*channel_update*: The hex string of the *channel_update* message received from the remote node. Only present if error is from the remote node and the *failcode* has the UPDATE bit set, as per BOLT #4.",
+    "",
+    "If *bolt11* is supplied, the invoice is submitted for preapproval through the HSM (as lightning-preapproveinvoice(7) does) before the payment is sent, once per payment (the first part only); a decline fails the request with error 213 instead of sending."
   ],
   "author": [
     "Rusty Russell [rusty@rustcorp.com.au](mailto:rusty@rustcorp.com.au) is mainly responsible."
