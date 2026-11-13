@@ -10,6 +10,8 @@
 #include <common/onionreply.h>
 #include <common/route.h>
 #include <common/timeout.h>
+#include <lightningd/hsm_control.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/channel.h>
 #include <lightningd/invoice.h>
 #include <lightningd/notification.h>
@@ -1332,6 +1334,53 @@ param_route_hop(struct command *cmd, const char *name, const char *buffer,
 	return NULL;
 }
 
+/* Preapproval round-trip for sendpay/sendonion: pay, xpay and keysend
+ * all preapprove before committing an outgoing payment, but the raw
+ * send primitives accepted an optional bolt11 without ever consulting
+ * preapproval, so a validating signer (remote hsmd) correctly refused
+ * the commitment (validate_payments: 0 + 0 < outgoing). This runs the
+ * same round-trip json_preapproveinvoice makes (invoice.c): the
+ * check_only variant never registers. */
+static struct command_result *
+sendpay_preapprove_invoice(struct command *cmd,
+			   const char *invstring,
+			   bool check_only)
+{
+	u8 *req;
+	const u8 *msg;
+	bool approved;
+
+	/* Old version didn't have `bool check_only` at end */
+	if (!hsm_capable(cmd->ld, WIRE_HSMD_PREAPPROVE_INVOICE_CHECK)) {
+		/* We can't just check this, so "succeed".  Log message for
+		 * tests though */
+		if (check_only) {
+			log_debug(cmd->ld->log,
+				  "hsmd too old to check preapprove");
+			return NULL;
+		}
+		req = towire_hsmd_preapprove_invoice(NULL, invstring);
+	} else {
+		req = towire_hsmd_preapprove_invoice_check(NULL, invstring,
+							   check_only);
+	}
+
+	msg = hsm_sync_req(tmpctx, cmd->ld, take(req));
+
+	/* These are identical, but use separate numbers for clarity */
+	if (!fromwire_hsmd_preapprove_invoice_reply(msg, &approved)
+	    && !fromwire_hsmd_preapprove_invoice_check_reply(msg, &approved)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "HSM gave bad preapprove_invoice_reply %s",
+				    tal_hex(msg, msg));
+	}
+
+	if (!approved)
+		return command_fail(cmd, PAY_INVOICE_PREAPPROVAL_DECLINED,
+				    "invoice was declined");
+	return NULL;
+}
+
 static struct command_result *json_sendonion(struct command *cmd,
 					     const char *buffer,
 					     const jsmntok_t *obj UNNEEDED,
@@ -1384,8 +1433,21 @@ static struct command_result *json_sendonion(struct command *cmd,
 				    "with failcode=%d",
 				    failcode);
 
-	if (command_check_only(cmd))
+	if (invstring && *partid == 0) {
+		struct command_result *ret;
+		if (command_check_only(cmd)) {
+			ret = sendpay_preapprove_invoice(cmd, invstring,
+							 true);
+			if (ret)
+				return ret;
+			return command_check_done(cmd);
+		}
+		ret = sendpay_preapprove_invoice(cmd, invstring, false);
+		if (ret)
+			return ret;
+	} else if (command_check_only(cmd)) {
 		return command_check_done(cmd);
+	}
 
 	return send_payment_core(ld, cmd, payment_hash, *partid, *group,
 				 first_hop, *msat, *total_msat,
@@ -1670,8 +1732,26 @@ static struct command_result *json_sendpay(struct command *cmd,
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "partid requires payment_secret");
 
-	if (command_check_only(cmd))
+	/* check sendpay validates signer policy too (check variant,
+	 * non-registering). */
+	if (invstring && *partid == 0) {
+		struct command_result *ret;
+		if (command_check_only(cmd)) {
+			ret = sendpay_preapprove_invoice(cmd, invstring,
+							 true);
+			if (ret)
+				return ret;
+			return command_check_done(cmd);
+		}
+		/* Register the invoice once per payment, not once per
+		 * part (partid 0, the same doctrine as pay's
+		 * preapproval, #7121). */
+		ret = sendpay_preapprove_invoice(cmd, invstring, false);
+		if (ret)
+			return ret;
+	} else if (command_check_only(cmd)) {
 		return command_check_done(cmd);
+	}
 
 	return send_payment(cmd->ld, cmd, rhash, *partid, *group,
 			    route,

@@ -523,6 +523,82 @@ def test_pay_maxfee_shadow(node_factory, xpay_handle_pay):
         assert pay_status["amount_msat"] == Millisatoshi(amount)
 
 
+def test_sendpay_preapprove(node_factory, bitcoind):
+    """sendpay and sendonion preapprove invoice payments like pay does
+
+    A raw sendpay never consulted preapproval, so with a validating
+    signer the outgoing HTLC was unregistered and the commitment
+    correctly refused. When bolt11 is supplied the RPCs now run the
+    preapproveinvoice round-trip first (once per payment: partid 0).
+    """
+    # The payer's hsmd declines every preapproval.
+    l1, l2 = node_factory.line_graph(2, fundamount=10**6,
+                                     opts=[{}, {'dev-hsmd-fail-preapprove': None}])
+
+    # Create some balance, make sure it's entirely settled.
+    l1.pay(l2, 200000000)
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['htlcs'] == [])
+
+    amt = 123000
+    inv = l1.rpc.invoice(amt, 'lbl', 'desc', 3700)
+    routestep = {
+        'amount_msat': amt,
+        'id': l1.info['id'],
+        'delay': 18,
+        'channel': first_scid(l2, l1)
+    }
+
+    # With bolt11 the preapproval decline fails the request...
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.sendpay([copy.deepcopy(routestep)], inv['payment_hash'],
+                       payment_secret=inv['payment_secret'],
+                       bolt11=inv['bolt11'])
+    # ...including in check mode.
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.check('sendpay', route=[copy.deepcopy(routestep)],
+                     payment_hash=inv['payment_hash'],
+                     payment_secret=inv['payment_secret'],
+                     bolt11=inv['bolt11'])
+
+    # Without bolt11 nothing is preapproved: the send proceeds and pays.
+    l2.rpc.sendpay([copy.deepcopy(routestep)], inv['payment_hash'],
+                   payment_secret=inv['payment_secret'])
+    l2.rpc.waitsendpay(inv['payment_hash'])
+    assert only_one(l1.rpc.listinvoices(label='lbl')['invoices'])['status'] == 'paid'
+
+    # Only partid 0 preapproves: a part with partid != 0 is not held up
+    # by the decline.
+    inv2 = l1.rpc.invoice(amt, 'lbl2', 'desc', 3700)
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.sendpay([copy.deepcopy(routestep)], inv2['payment_hash'],
+                       payment_secret=inv2['payment_secret'],
+                       bolt11=inv2['bolt11'])
+    l2.rpc.call('sendpay', {
+        'route': [copy.deepcopy(routestep)],
+        'payment_hash': inv2['payment_hash'],
+        'payment_secret': inv2['payment_secret'],
+        'amount_msat': amt, 'groupid': 1, 'partid': 1})
+    l2.rpc.call('waitsendpay', {'payment_hash': inv2['payment_hash'],
+                                'partid': 1})
+    assert only_one(l1.rpc.listinvoices(label='lbl2')['invoices'])['status'] == 'paid'
+
+    # And sendonion gets the same treatment.
+    inv3 = l1.rpc.invoice(amt, 'lbl3', 'desc', 3700)
+    blockheight = l2.rpc.getinfo()['blockheight']
+    hops = [{
+        'pubkey': l1.info['id'],
+        'payload': serialize_payload_final_tlv(amt, 18, amt, blockheight,
+                                               inv3['payment_secret']).hex()
+    }]
+    onion = l2.rpc.createonion(hops=hops, assocdata=inv3['payment_hash'])
+    first_hop = {'id': l1.info['id'], 'amount_msat': amt, 'delay': 18}
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.sendonion(onion=onion['onion'],
+                         first_hop=first_hop,
+                         payment_hash=inv3['payment_hash'],
+                         bolt11=inv3['bolt11'])
+
+
 def test_sendpay(node_factory):
     l1, l2 = node_factory.line_graph(2, fundamount=10**6)
 
