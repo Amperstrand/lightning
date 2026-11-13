@@ -326,8 +326,11 @@
     "The following error codes may occur:",
     "",
     "- 202: an parseable onion",
+    "- 213: The invoice was declined by the signer's preapproval (only possible when *bolt11* is supplied; see lightning-preapproveinvoice(7)).",
     "",
-    "the error details are decrypted and presented here, if *shared_secrets* was provided and an error was returned by one of the intermediate nodes"
+    "the error details are decrypted and presented here, if *shared_secrets* was provided and an error was returned by one of the intermediate nodes",
+    "",
+    "If *bolt11* is supplied, the invoice is submitted for preapproval through the HSM (as lightning-preapproveinvoice(7) does) before the payment is sent, once per payment (the first part only); a decline fails the request with error 213 instead of sending."
   ],
   "author": [
     "Christian Decker [decker.christian@gmail.com](mailto:decker.christian@gmail.com) is mainly responsible."
