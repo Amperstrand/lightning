@@ -23,7 +23,6 @@ import math
 import mnemonic
 import glob
 import os
-import sysconfig
 import random
 import re
 import shutil
@@ -878,9 +877,16 @@ class LightningD(TailableProc):
         # tests/plugins/coin_movements.py importing pyln.client) resolve
         # against the SYSTEM python, not the venv running pytest -- a
         # ModuleNotFoundError at getmanifest and a dead plugin. Put this
-        # tree's pyln packages on the daemon env's PYTHONPATH so plugin
-        # subprocesses import the same pyln the tests do. Harmless (path
-        # duplication) when pyln is installed system-wide.
+        # tree's pyln packages (pure Python, interpreter-independent) on
+        # the daemon env's PYTHONPATH, and prepend the test interpreter's
+        # bin dir to PATH so the shebang selects the SAME interpreter the
+        # tests run under. Never expose one interpreter's site-packages to
+        # another: a `purelib` entry is ABI-locked (a CPython 3.12 plugin
+        # cannot load a CPython 3.14 wheel and still exits with
+        # ModuleNotFoundError), which is exactly the mismatch this block
+        # exists to fix -- so the venv's compiled deps (coincurve etc.)
+        # must be reached by running the venv's python, not by path
+        # sharing.
         _tree_root = os.path.dirname(os.path.abspath(__file__))
         for _ in range(6):
             if os.path.isdir(os.path.join(_tree_root, 'contrib', 'pyln-testing')):
@@ -893,17 +899,16 @@ class LightningD(TailableProc):
             os.path.join(_tree_root, 'contrib', 'pyln-grpc-proto'),
         ] + sorted(glob.glob(os.path.join(
             _tree_root, 'contrib', 'pyln-spec', 'bolt*')))
-        # Third-party deps of those packages (e.g. PySocks for
-        # pyln.proto) live in the RUNNING interpreter's site-packages
-        # (the venv under a harness) -- the daemon env does not inherit
-        # it, so append it after the tree paths.
-        _purelib = sysconfig.get_paths()['purelib']
-        if os.path.isdir(_purelib):
-            _pyln_paths.append(_purelib)
 
         self.env['PYTHONPATH'] = os.pathsep.join(
             _pyln_paths + ([self.env['PYTHONPATH']]
                            if 'PYTHONPATH' in self.env else []))
+        # The shebang's `python3` must resolve to the test interpreter:
+        # its site-packages (with the compiled deps the tree's pyln
+        # imports need) are then found natively, ABI-correct.
+        self.env['PATH'] = os.pathsep.join(
+            [os.path.dirname(os.path.abspath(sys.executable)),
+             self.env['PATH']])
 
         self.opts = LIGHTNINGD_CONFIG.copy()
 
