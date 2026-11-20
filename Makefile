@@ -484,6 +484,7 @@ BIN_PROGRAMS = \
 PKGLIBEXEC_PROGRAMS = \
 	       lightningd/lightning_channeld \
 	       lightningd/lightning_closingd \
+	       lightningd/lightning_simpleclosed \
 	       lightningd/lightning_connectd \
 	       lightningd/lightning_dualopend \
 	       lightningd/lightning_gossipd \
