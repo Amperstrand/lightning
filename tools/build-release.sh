@@ -22,6 +22,21 @@ if [ "$1" = "--inside-docker" ]; then
     ./configure
     uv run make -j"$MAKEPAR" VERSION="$VER"
     uv run make -j"$MAKEPAR" install DESTDIR=/"$VER-$PLTFM-$PLTFMVER-$ARCH" RUST_PROFILE=release
+    # Every subdaemon we built must be in the staged tree: the install
+    # list (PKGLIBEXEC_PROGRAMS) is maintained by hand and has drifted
+    # before (simpleclosed, v26.12rc1: built, negotiated, never shipped).
+    staged="/$VER-$PLTFM-$PLTFMVER-$ARCH"
+    for subd in /build/lightningd/lightning_*; do
+	name=$(basename "$subd")
+	if [ "$name" = "lightningd" ] || ! [ -x "$subd" ]; then
+	    continue
+	fi
+	if ! find "$staged" -type f -name "$name" -path "*libexec*" | grep -q .; then
+	    echo "ERROR: subdaemon $name was built but not installed (PKGLIBEXEC_PROGRAMS out of date?)" >&2
+	    find "$staged" -path "*libexec*" -name 'lightning_*' >&2
+	    exit 1
+	fi
+    done
     cd /"$VER-$PLTFM-$PLTFMVER-$ARCH"
     LC_ALL=C tar --sort=name -c -v -z -f /release/clightning-"$VER-$PLTFM-$PLTFMVER-$ARCH".tar.gz --mtime='@1672531200' -- *
     echo "Inside docker: build finished"
